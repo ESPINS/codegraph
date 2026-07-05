@@ -95,21 +95,28 @@ describe('MyBatisParserExtractor — robustness', () => {
     expect(names).not.toContain('dead');
   });
 
-  it('reports the correct startLine past multibyte (non-ASCII) content', () => {
-    // Five multibyte comment lines precede the statement. In UTF-8 each
-    // Korean char is 3 bytes, so by the <select> the byte offset has drifted
-    // well over a line-width ahead of the char offset — a byte offset fed to
-    // a char-index line lookup would overshoot to line 7. The correct
-    // byte-space mapping must report line 6.
+  it('reports the correct startLine past multibyte content (statement mid-document)', () => {
+    // Five multibyte (3-byte-per-char) comment lines inflate the target's
+    // byte offset far beyond its char offset; the trailing statements extend
+    // the document so a char-space line lookup fed a byte offset overshoots
+    // (verified empirically: to line 10). The correct byte-space mapping
+    // reports line 6. The statement must NOT sit on the last line, or a
+    // char-space lookup would clamp to the right answer by accident.
     const xml =
-      '<mapper namespace="com.example.FooMapper"><!-- 한국어 첫째 줄 주석 여러 글자입니다 -->\n' +
+      '<mapper namespace="com.example.FooMapper"><!-- 한국어 첫째 줄 주석 여러 글자입니다 매우 긴 설명 -->\n' +
       '<!-- 둘째 줄 한국어 주석 여러 글자입니다 매우 긴 설명 -->\n' +
       '<!-- 셋째 줄 한국어 주석 여러 글자입니다 매우 긴 설명 -->\n' +
       '<!-- 넷째 줄 한국어 주석 여러 글자입니다 매우 긴 설명 -->\n' +
       '<!-- 다섯째 줄 한국어 주석 여러 글자입니다 매우 긴 설명 -->\n' +
-      '<select id="getById">SELECT 1</select></mapper>';
-    const stmt = methods('FooMapper.xml', xml).find((n) => n.name === 'getById')!;
-    expect(stmt.startLine).toBe(6);
+      '<select id="target">SELECT 1</select>\n' +
+      '<select id="after1">SELECT 2</select>\n' +
+      '<select id="after2">SELECT 3</select>\n' +
+      '<select id="after3">SELECT 4</select>\n' +
+      '</mapper>';
+    const found = methods('FooMapper.xml', xml);
+    expect(found.find((n) => n.name === 'target')!.startLine).toBe(6);
+    // A later statement's line is byte-offset-dependent too — a second guard.
+    expect(found.find((n) => n.name === 'after3')!.startLine).toBe(9);
   });
 
   it('normalizes ${} to the __BATIS_DYN__ sentinel in the docstring', () => {
