@@ -96,13 +96,49 @@ describe('MyBatisParserExtractor — robustness', () => {
   });
 
   it('reports the correct startLine past multibyte (non-ASCII) content', () => {
-    // The Korean comment on line 1 is multibyte in UTF-8; a byte-offset →
-    // line mapping that ignored byte width would land the <select> on the
-    // wrong line. It is on document line 2.
+    // Five multibyte comment lines precede the statement. In UTF-8 each
+    // Korean char is 3 bytes, so by the <select> the byte offset has drifted
+    // well over a line-width ahead of the char offset — a byte offset fed to
+    // a char-index line lookup would overshoot to line 7. The correct
+    // byte-space mapping must report line 6.
     const xml =
-      '<mapper namespace="com.example.FooMapper"><!-- 한국어 주석 여러 글자 설명 -->\n' +
+      '<mapper namespace="com.example.FooMapper"><!-- 한국어 첫째 줄 주석 여러 글자입니다 -->\n' +
+      '<!-- 둘째 줄 한국어 주석 여러 글자입니다 매우 긴 설명 -->\n' +
+      '<!-- 셋째 줄 한국어 주석 여러 글자입니다 매우 긴 설명 -->\n' +
+      '<!-- 넷째 줄 한국어 주석 여러 글자입니다 매우 긴 설명 -->\n' +
+      '<!-- 다섯째 줄 한국어 주석 여러 글자입니다 매우 긴 설명 -->\n' +
       '<select id="getById">SELECT 1</select></mapper>';
     const stmt = methods('FooMapper.xml', xml).find((n) => n.name === 'getById')!;
-    expect(stmt.startLine).toBe(2);
+    expect(stmt.startLine).toBe(6);
+  });
+
+  it('normalizes ${} to the __BATIS_DYN__ sentinel in the docstring', () => {
+    const xml =
+      '<mapper namespace="com.example.FooMapper">' +
+      '<select id="listing">SELECT * FROM t ORDER BY ${sortColumn}</select></mapper>';
+    const doc = methods('FooMapper.xml', xml).find((n) => n.name === 'listing')!.docstring!;
+    expect(doc).toContain('__BATIS_DYN__');
+    expect(doc).not.toContain('${');
+  });
+
+  it('flattens a branch-limit-exceeded statement via the union fallback', () => {
+    // Six <if> branches = 2^6 = 64 combinations, over batis-xml's cap of 32,
+    // so the SQL comes back as a single union of all branch text. The node
+    // must still be emitted with that flattened text in its docstring.
+    let body = 'SELECT 1';
+    for (let i = 0; i < 6; i++) body += `<if test="c${i}"> AND x${i} = 1</if>`;
+    const xml = `<mapper namespace="com.example.FooMapper"><select id="wide">${body}</select></mapper>`;
+    const stmt = methods('FooMapper.xml', xml).find((n) => n.name === 'wide')!;
+    expect(stmt).toBeDefined();
+    expect(stmt.docstring).toContain('x5 = 1');
+  });
+
+  it('gives <sql> fragment nodes a flattened docstring (FTS parity)', () => {
+    const xml =
+      '<mapper namespace="com.example.FooMapper">' +
+      '<sql id="cols">id, name, email</sql>' +
+      '<select id="getById">SELECT <include refid="cols"/> FROM users</select></mapper>';
+    const frag = methods('FooMapper.xml', xml).find((n) => n.name === 'cols')!;
+    expect(frag.docstring).toContain('id, name, email');
   });
 });

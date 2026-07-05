@@ -16,9 +16,9 @@ import { generateNodeId } from './tree-sitter-helpers';
  *   - correct handling of single-quoted attributes, XML comments, CDATA,
  *     and entities (a real parser, not a regex);
  *   - properly flattened dynamic SQL in the docstring — `<if>/<choose>/
- *     <foreach>` branches and `#{}`/`${}` placeholders are resolved rather
- *     than crudely tag-stripped, so the FTS-indexed docstring reflects SQL
- *     that can actually run.
+ *     <foreach>` branches are expanded and placeholders normalized (`#{}`
+ *     → `?`, `${}` → a `__BATIS_DYN__` sentinel) rather than crudely
+ *     tag-stripped, so the FTS-indexed docstring reflects real SQL structure.
  *
  * Selected via `CODEGRAPH_MYBATIS_EXTRACTOR=parser` (see tree-sitter.ts);
  * the regex extractor remains the default. `batis-xml` is lazy-required so
@@ -57,6 +57,7 @@ interface BxStatement {
 interface BxFragment {
   span: BxSpan;
   id: BxSpanned<string>;
+  sql: BxSqlText;
   includes: Array<BxSpanned<BxIncludeRef>>;
 }
 interface BxMapper {
@@ -182,6 +183,7 @@ export class MyBatisParserExtractor {
         endLine: this.byteLine(frag.span.end),
         startColumn: 0,
         endColumn: 0,
+        docstring: this.flattenSql(frag.sql),
         updatedAt: Date.now(),
       });
       this.edges.push({ source: fileNodeId, target: nodeId, kind: 'contains' });
