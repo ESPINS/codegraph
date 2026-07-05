@@ -29,6 +29,7 @@ import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { MyBatisParserExtractor } from './mybatis-parser-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import {
   getAllFrameworkResolvers,
@@ -6378,7 +6379,12 @@ export function extractFromSource(
   } else if (detectedLanguage === 'xml') {
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
     // file node so the watcher tracks it without emitting symbols.
-    const extractor = new MyBatisExtractor(filePath, source);
+    // Opt-in parser-backed extractor (batis-xml) adds iBatis <sqlMap> coverage
+    // and correct comment/CDATA/dynamic-SQL handling; regex remains default.
+    const extractor =
+      process.env.CODEGRAPH_MYBATIS_EXTRACTOR === 'parser'
+        ? new MyBatisParserExtractor(filePath, source)
+        : new MyBatisExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'cfml' || detectedLanguage === 'cfscript') {
     // Custom extractor for CFML (.cfc/.cfm) — dialect-switches between the
