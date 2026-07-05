@@ -55,3 +55,43 @@ describe('MyBatis extractor — attribute quoting', () => {
     expect(methodNames(xml)).toContain('com.example.FooMapper::getById');
   });
 });
+
+describe('MyBatis extractor — XML comments', () => {
+  const result = (xml: string) => extractFromSource('FooMapper.xml', xml);
+
+  it('does not emit a node for a statement inside a comment', () => {
+    const xml =
+      '<mapper namespace="com.example.FooMapper">' +
+      '<!-- <select id="dead">SELECT 1</select> -->' +
+      '<select id="live">SELECT 2</select></mapper>';
+    const names = result(xml)
+      .nodes.filter((n) => n.kind === 'method')
+      .map((n) => n.name);
+    expect(names).toContain('live');
+    expect(names).not.toContain('dead');
+  });
+
+  it('does not follow an <include> inside a comment', () => {
+    const xml =
+      '<mapper namespace="com.example.FooMapper">' +
+      '<select id="getById">SELECT 1 <!-- <include refid="cols"/> --></select>' +
+      '</mapper>';
+    const refs = result(xml).unresolvedReferences.map((r) => r.referenceName);
+    expect(refs).not.toContain('com.example.FooMapper::cols');
+  });
+
+  it('keeps the correct startLine for a statement after a multi-line comment', () => {
+    const xml =
+      '<mapper namespace="com.example.FooMapper">\n' +
+      '<!--\n' +
+      '  a commented-out block\n' +
+      '  spanning several lines\n' +
+      '-->\n' +
+      '<select id="getById">SELECT 1</select>\n' +
+      '</mapper>\n';
+    const stmt = result(xml).nodes.find((n) => n.name === 'getById');
+    expect(stmt).toBeDefined();
+    // The <select> is on the 6th line of the document.
+    expect(stmt!.startLine).toBe(6);
+  });
+});

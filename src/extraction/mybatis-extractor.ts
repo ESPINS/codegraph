@@ -35,8 +35,41 @@ export class MyBatisExtractor {
 
   constructor(filePath: string, source: string) {
     this.filePath = filePath;
-    this.source = source;
+    // Blank out XML comments up front so commented-out statements and
+    // includes aren't matched by the scans below. Length-preserving, so the
+    // offsets and line numbers computed afterwards still map to the original.
+    this.source = MyBatisExtractor.stripXmlComments(source);
     this.computeLineStarts();
+  }
+
+  /**
+   * Replace every `<!-- ... -->` region with spaces, keeping newlines and the
+   * total length intact so byte offsets and line numbers still map to the
+   * original source. Text inside `<![CDATA[ ... ]]>` is left untouched — a
+   * literal `<!--` there is SQL data, not an XML comment.
+   */
+  private static stripXmlComments(source: string): string {
+    const out = source.split('');
+    const n = source.length;
+    let i = 0;
+    while (i < n) {
+      if (source.startsWith('<![CDATA[', i)) {
+        const end = source.indexOf(']]>', i + 9);
+        i = end >= 0 ? end + 3 : n;
+        continue;
+      }
+      if (source.startsWith('<!--', i)) {
+        const end = source.indexOf('-->', i + 4);
+        const stop = end >= 0 ? end + 3 : n;
+        for (let j = i; j < stop; j++) {
+          if (source.charCodeAt(j) !== 10) out[j] = ' ';
+        }
+        i = stop;
+        continue;
+      }
+      i++;
+    }
+    return out.join('');
   }
 
   extract(): ExtractionResult {
