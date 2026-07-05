@@ -128,6 +128,10 @@ export class MyBatisExtractor {
     const open = /<mapper\b([^>]*)>/.exec(this.source);
     if (!open) return null;
     const attrs = open[1] ?? '';
+    // Accept either quote style (`(["'])...\1`). The identifier-shaped MyBatis
+    // attributes matched here and below (namespace/id/refid/resultType/
+    // parameterType) are Java FQNs, method names, or type aliases and never
+    // contain a quote character, so excluding both quotes from the value is safe.
     const nsMatch = /\bnamespace\s*=\s*(["'])([^"']+)\1/.exec(attrs);
     if (!nsMatch) return null;
     const bodyStart = open.index + open[0].length;

@@ -94,4 +94,31 @@ describe('MyBatis extractor — XML comments', () => {
     // The <select> is on the 6th line of the document.
     expect(stmt!.startLine).toBe(6);
   });
+
+  it('treats <!-- and --> inside CDATA as data, not comment delimiters', () => {
+    // A commented-looking sequence split across two CDATA sections must not
+    // blank the real statement between them — guards the CDATA-skip branch.
+    const xml =
+      '<mapper namespace="com.example.FooMapper">' +
+      '<![CDATA[<!--]]>' +
+      '<select id="live">SELECT 1</select>' +
+      '<![CDATA[-->]]>' +
+      '</mapper>';
+    const names = result(xml)
+      .nodes.filter((n) => n.kind === 'method')
+      .map((n) => n.name);
+    expect(names).toContain('live');
+  });
+
+  it('does not crash on an unterminated comment (blanks to end of file)', () => {
+    const xml =
+      '<mapper namespace="com.example.FooMapper">' +
+      '<select id="before">SELECT 1</select>' +
+      '<!-- unterminated, swallowing a <select id="after">SELECT 2</select>';
+    const names = result(xml)
+      .nodes.filter((n) => n.kind === 'method')
+      .map((n) => n.name);
+    expect(names).toContain('before');
+    expect(names).not.toContain('after');
+  });
 });
