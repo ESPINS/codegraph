@@ -142,3 +142,63 @@ describe('MyBatisParserExtractor — robustness', () => {
     expect(frag.docstring).toContain('id, name, email');
   });
 });
+
+// Synthetic mapper XML adapted verbatim from batis-xml's own conformance
+// corpus — the cases a real parser handles but a regex scan cannot. All
+// synthetic; no proprietary source.
+describe('MyBatisParserExtractor — corpus fixtures', () => {
+  it('iBatis <sqlMap> with a doubled-delimiter escape and a DAO.method id', () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE sqlMap PUBLIC "-//ibatis.apache.org//DTD SQL Map 2.0//EN"
+  "http://ibatis.apache.org/dtd/sql-map-2.dtd">
+<sqlMap>
+  <select id="widgetDAO.selectIntoTempTable" parameterClass="map" resultClass="widget">
+    SELECT widget_id, widget_name INTO ##widget_tmp
+    FROM demo_widget WHERE group_code = #groupCode#
+  </select>
+</sqlMap>`;
+    const stmt = methods('WidgetDAO.xml', xml).find((n) => n.name === 'selectIntoTempTable')!;
+    expect(stmt.qualifiedName).toBe('widgetDAO::selectIntoTempTable');
+    // ## → literal #, #groupCode# → ?  (neither survives verbatim)
+    expect(stmt.docstring).toContain('INTO #widget_tmp');
+    expect(stmt.docstring).not.toContain('##');
+    expect(stmt.docstring).toContain('group_code = ?');
+  });
+
+  it('MyBatis comparison operators inside CDATA survive with placeholders normalized', () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+  "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.example.demo.mapper.WidgetMapper">
+  <select id="searchWidgetsByPriceRange" resultType="com.example.demo.model.Widget">
+    SELECT widget_id, widget_name FROM demo_widget
+    <![CDATA[
+    WHERE widget_price > #{minPrice}
+      AND widget_price < #{maxPrice}
+      AND created_at >= #{startDate}
+    ]]>
+  </select>
+</mapper>`;
+    const doc = methods('WidgetMapper.xml', xml).find(
+      (n) => n.name === 'searchWidgetsByPriceRange'
+    )!.docstring!;
+    expect(doc).toContain('widget_price > ?');
+    expect(doc).toContain('widget_price < ?');
+  });
+
+  it('iBatis $var$ dynamic column marker normalizes to the sentinel', () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE sqlMap PUBLIC "-//ibatis.apache.org//DTD SQL Map 2.0//EN"
+  "http://ibatis.apache.org/dtd/sql-map-2.dtd">
+<sqlMap>
+  <select id="widgetDAO.selectSorted" parameterClass="map" resultClass="widget">
+    SELECT widget_id, widget_name
+    FROM demo_widget
+    ORDER BY $sortColumn$ ASC
+  </select>
+</sqlMap>`;
+    const stmt = methods('WidgetDAO.xml', xml).find((n) => n.name === 'selectSorted')!;
+    expect(stmt.qualifiedName).toBe('widgetDAO::selectSorted');
+    expect(stmt.docstring).toContain('ORDER BY __BATIS_DYN__');
+  });
+});
