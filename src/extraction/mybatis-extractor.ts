@@ -123,7 +123,21 @@ export class MyBatisExtractor {
       const endLine = this.getLineNumber(absoluteIndex + m[0].length);
       const qualified = `${namespace}::${id}`;
       const isSqlFragment = elemType === 'sql';
-      const nodeId = generateNodeId(this.filePath, 'method', qualified, startLine);
+      // Fold the statement's byte offset into the id-hash input so two
+      // statements sharing a qualifiedName AND a start line (a same-line
+      // dual-dialect databaseId="oracle"/"mysql" pair) get DISTINCT ids
+      // rather than colliding — `INSERT OR REPLACE INTO nodes` (id is the
+      // PRIMARY KEY) would otherwise silently drop the first. A NUL
+      // separator cannot occur in a qualifiedName, so it can't be spoofed;
+      // the stored `qualifiedName` is untouched, so the Java->XML bridge
+      // (which matches on qualifiedName) is unaffected. Mirrors the same
+      // fix in mybatis-parser-extractor.ts.
+      const nodeId = generateNodeId(
+        this.filePath,
+        'method',
+        `${qualified}\0${absoluteIndex}`,
+        startLine
+      );
       const node: Node = {
         id: nodeId,
         kind: 'method',
