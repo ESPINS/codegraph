@@ -232,8 +232,9 @@ describe('MyBatisParserExtractor — databaseId dual-dialect statements', () => 
     const found = methods('UserMapper.xml', xml);
     expect(found).toHaveLength(2);
     expect(found.every((n) => n.qualifiedName === 'com.example.UserMapper::findUser')).toBe(true);
-    // Distinct spans keep the two nodes distinguishable (and their node ids
-    // distinct, since id derives from filePath:kind:qualifiedName:startLine).
+    // Distinct spans keep the two nodes distinguishable; their node ids are
+    // distinct because the id folds in each statement's byte offset (see the
+    // same-line regression test below and `methodNodeId` in the extractor).
     expect(new Set(found.map((n) => n.startLine)).size).toBe(2);
     expect(new Set(found.map((n) => n.id)).size).toBe(2);
     // Neither dialect's SQL is silently dropped.
@@ -242,6 +243,29 @@ describe('MyBatisParserExtractor — databaseId dual-dialect statements', () => 
     // No `databaseId`/`database_id` field is represented on the emitted
     // nodes at all — the wrapper simply doesn't read it.
     expect(found.every((n) => !('databaseId' in n) && !('database_id' in n))).toBe(true);
+  });
+
+  it('disambiguates a SAME-LINE dual-dialect pair by byte offset (no id collision, no data loss)', () => {
+    // Regression: both statements sit on ONE line, so they share a
+    // qualifiedName AND a startLine. A startLine-only node id would hash to
+    // the same value for both, and `INSERT OR REPLACE INTO nodes` (id is the
+    // PRIMARY KEY) would silently drop the first. The id must fold in each
+    // statement's byte offset so the two stay distinct.
+    const xml =
+      '<mapper namespace="com.example.UserMapper">' +
+      '<select id="findUser" databaseId="oracle">SELECT * FROM users WHERE ROWNUM = 1</select>' +
+      '<select id="findUser" databaseId="mysql">SELECT * FROM users LIMIT 1</select>' +
+      '</mapper>';
+    const found = methods('UserMapper.xml', xml);
+    expect(found).toHaveLength(2);
+    // Same qualifiedName AND same startLine (both on line 1) — the collision
+    // precondition...
+    expect(found.every((n) => n.qualifiedName === 'com.example.UserMapper::findUser')).toBe(true);
+    expect(new Set(found.map((n) => n.startLine)).size).toBe(1);
+    // ...yet distinct node ids, so neither node overwrites the other on insert.
+    expect(new Set(found.map((n) => n.id)).size).toBe(2);
+    expect(found.some((n) => n.docstring?.includes('ROWNUM = 1'))).toBe(true);
+    expect(found.some((n) => n.docstring?.includes('LIMIT 1'))).toBe(true);
   });
 });
 

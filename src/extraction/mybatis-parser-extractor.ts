@@ -145,7 +145,7 @@ export class MyBatisParserExtractor {
       if (!stmt.id) continue; // a statement without an id can't be qualified
       const { qualifiedName, name } = this.qualify(namespace, stmt.id.value);
       const startLine = this.byteLine(stmt.span.start);
-      const nodeId = generateNodeId(this.filePath, 'method', qualifiedName, startLine);
+      const nodeId = this.methodNodeId(qualifiedName, stmt.span.start, startLine);
       this.nodes.push({
         id: nodeId,
         kind: 'method',
@@ -170,7 +170,7 @@ export class MyBatisParserExtractor {
     for (const frag of mapper.fragments) {
       const { qualifiedName, name } = this.qualify(namespace, frag.id.value);
       const startLine = this.byteLine(frag.span.start);
-      const nodeId = generateNodeId(this.filePath, 'method', qualifiedName, startLine);
+      const nodeId = this.methodNodeId(qualifiedName, frag.span.start, startLine);
       this.nodes.push({
         id: nodeId,
         kind: 'method',
@@ -230,6 +230,28 @@ export class MyBatisParserExtractor {
       return { qualifiedName: `${id.slice(0, dot)}::${id.slice(dot + 1)}`, name: id.slice(dot + 1) };
     }
     return { qualifiedName: id, name: id };
+  }
+
+  /**
+   * Compute a node id for a mybatis method-shaped node (statement, `<sql>`
+   * fragment, or `<selectKey>` child — all flow through the same statement
+   * loop since batis-xml synthesizes the latter's id as `<id>!selectKey`).
+   *
+   * `generateNodeId` hashes `filePath:kind:name:line` and ignores byte
+   * offset/column, so two statements sharing a qualifiedName AND a start
+   * line (e.g. a same-line dual-dialect `databaseId="oracle"`/`"mysql"`
+   * pair) would otherwise hash to the SAME id, and `INSERT OR REPLACE INTO
+   * nodes` (id is the PRIMARY KEY) would silently drop the first one.
+   *
+   * Fix: mix the statement's byte offset into the hash INPUT via a NUL
+   * separator (`\0`), which cannot appear in a qualifiedName, so it can't be
+   * spoofed by any real identifier. This only disambiguates the id string
+   * fed to the shared hash helper — the node's stored `qualifiedName` field
+   * is untouched, so `mybatisJavaXmlEdges` (which matches on qualifiedName)
+   * keeps working unchanged.
+   */
+  private methodNodeId(qualifiedName: string, byteOffset: number, startLine: number): string {
+    return generateNodeId(this.filePath, 'method', `${qualifiedName}\0${byteOffset}`, startLine);
   }
 
   private buildSignature(stmt: BxStatement): string {
