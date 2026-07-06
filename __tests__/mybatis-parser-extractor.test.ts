@@ -209,3 +209,59 @@ describe('MyBatisParserExtractor — corpus fixtures', () => {
     expect(stmt.docstring).toContain('ORDER BY __BATIS_DYN__');
   });
 });
+
+describe('MyBatisParserExtractor — databaseId dual-dialect statements', () => {
+  // Shape adapted from a real legacy iBatis/MyBatis batch codebase that
+  // declares the SAME statement id twice with different vendor databaseId
+  // (oracle/mysql), each with its own dialect-specific SQL body. The wrapper
+  // never reads `database_id` from batis-xml's model (grep-confirmed), so
+  // this pins the OBSERVED behavior rather than an assumed one: both
+  // statements are emitted as separate method nodes sharing one
+  // qualifiedName, distinguished by span (startLine/endLine) and each
+  // retaining its own docstring — no databaseId field appears anywhere in
+  // the output, and neither SQL body is lost.
+  it('emits both dialect statements as distinct nodes under the same qualifiedName, each keeping its own SQL', () => {
+    const xml = `<mapper namespace="com.example.UserMapper">
+  <select id="findUser" databaseId="oracle" resultType="User">
+    SELECT * FROM users WHERE ROWNUM = 1 AND id = #{id}
+  </select>
+  <select id="findUser" databaseId="mysql" resultType="User">
+    SELECT * FROM users WHERE id = #{id} LIMIT 1
+  </select>
+</mapper>`;
+    const found = methods('UserMapper.xml', xml);
+    expect(found).toHaveLength(2);
+    expect(found.every((n) => n.qualifiedName === 'com.example.UserMapper::findUser')).toBe(true);
+    // Distinct spans keep the two nodes distinguishable (and their node ids
+    // distinct, since id derives from filePath:kind:qualifiedName:startLine).
+    expect(new Set(found.map((n) => n.startLine)).size).toBe(2);
+    expect(new Set(found.map((n) => n.id)).size).toBe(2);
+    // Neither dialect's SQL is silently dropped.
+    expect(found.some((n) => n.docstring?.includes('ROWNUM = 1'))).toBe(true);
+    expect(found.some((n) => n.docstring?.includes('LIMIT 1'))).toBe(true);
+    // No `databaseId`/`database_id` field is represented on the emitted
+    // nodes at all — the wrapper simply doesn't read it.
+    expect(found.every((n) => !('databaseId' in n) && !('database_id' in n))).toBe(true);
+  });
+});
+
+describe('MyBatisParserExtractor — <selectKey> node synthesis', () => {
+  it('emits both the parent insert node and its "<id>!selectKey" child node', () => {
+    const xml =
+      '<mapper namespace="com.example.UserMapper">' +
+      '<insert id="insertUser">' +
+      '<selectKey keyProperty="id" resultType="int" order="BEFORE">SELECT nextval(\'user_seq\')</selectKey>' +
+      'INSERT INTO users (id, name) VALUES (#{id}, #{name})' +
+      '</insert>' +
+      '</mapper>';
+    const found = methods('UserMapper.xml', xml);
+    const names = found.map((n) => n.name);
+    expect(names).toContain('insertUser');
+    expect(names).toContain('insertUser!selectKey');
+    const parent = found.find((n) => n.name === 'insertUser')!;
+    const key = found.find((n) => n.name === 'insertUser!selectKey')!;
+    expect(parent.qualifiedName).toBe('com.example.UserMapper::insertUser');
+    expect(key.qualifiedName).toBe('com.example.UserMapper::insertUser!selectKey');
+    expect(key.docstring).toContain("nextval('user_seq')");
+  });
+});
