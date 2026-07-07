@@ -246,3 +246,36 @@ describe('MyBatis extractor — whitespace in close tags', () => {
     expect(refs).toContain('com.example.FooMapper::cols');
   });
 });
+
+// A fully-qualified `<include refid="a.b.C.frag">` names the fragment by its
+// full `namespace.id`, where the namespace itself is dotted (a Java package).
+// This is a real cross-mapper pattern (shared `<sql>` fragments). Only the final
+// dot is the namespace/id boundary, so only it becomes `::` — matching the
+// `<sql>` fragment's own `namespace::id` qualified name.
+describe('MyBatis extractor — qualified include refid', () => {
+  it('resolves a cross-mapper refid whose namespace has multiple dots', () => {
+    const xml =
+      '<mapper namespace="com.example.M">' +
+      '<sql id="base">id, name</sql>' +
+      '<select id="getAll">SELECT <include refid="com.example.M.base"/> FROM t</select>' +
+      '</mapper>';
+    const res = extractFromSource('M.xml', xml);
+    const fragment = res.nodes.find((n) => n.qualifiedName.endsWith('::base'));
+    const refs = res.unresolvedReferences.map((r) => r.referenceName);
+    // the reference must name the fragment exactly as the fragment node is keyed
+    expect(fragment?.qualifiedName).toBe('com.example.M::base');
+    expect(refs).toContain('com.example.M::base');
+  });
+
+  it('still resolves a same-namespace bare refid (regression guard)', () => {
+    const xml =
+      '<mapper namespace="com.example.M">' +
+      '<sql id="base">id</sql>' +
+      '<select id="getAll">SELECT <include refid="base"/> FROM t</select>' +
+      '</mapper>';
+    const refs = extractFromSource('M.xml', xml).unresolvedReferences.map(
+      (r) => r.referenceName
+    );
+    expect(refs).toContain('com.example.M::base');
+  });
+});

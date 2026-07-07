@@ -245,11 +245,20 @@ export class MyBatisExtractor {
       let inc: RegExpExecArray | null;
       while ((inc = includeRegex.exec(elemBody)) !== null) {
         const refid = inc[2]!;
-        const refQualified = refid.includes('.')
-          ? refid.replace(/\./g, '::')
-          : namespace
-            ? `${namespace}::${refid}`
-            : refid;
+        // A qualified refid is `<namespace>.<fragmentId>` where the namespace
+        // itself contains dots (`com.example.M.base`). Split on the LAST dot so
+        // only the namespace/id boundary becomes `::` and the namespace keeps
+        // its dots — matching how a `<sql>` fragment's own qualifiedName is
+        // built (`com.example.M::base`). Replacing *every* dot (the old
+        // behavior) produced `com::example::M::base`, which resolved against
+        // nothing once a namespace had two or more dots.
+        const dot = refid.lastIndexOf('.');
+        const refQualified =
+          dot >= 0
+            ? `${refid.slice(0, dot)}::${refid.slice(dot + 1)}`
+            : namespace
+              ? `${namespace}::${refid}`
+              : refid;
         const includeOffset = absoluteIndex + openTagLen + inc.index;
         const line = this.getLineNumber(includeOffset);
         this.unresolvedReferences.push({
