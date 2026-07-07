@@ -185,7 +185,11 @@ export class MyBatisExtractor {
       dialect === 'ibatis'
         ? 'select|insert|update|delete|sql|statement|procedure'
         : 'select|insert|update|delete|sql';
-    const stmtRegex = new RegExp(`<(${verbs})\\b([^>]*)>([\\s\\S]*?)</\\1>`, 'g');
+    // `</\\1\\s*>` tolerates a close tag written with trailing whitespace
+    // (`</select >`, which is legal XML) — without the `\s*` the non-greedy body
+    // would run past it to the next real close and swallow the following
+    // statement whole.
+    const stmtRegex = new RegExp(`<(${verbs})\\b([^>]*)>([\\s\\S]*?)</\\1\\s*>`, 'g');
     let m: RegExpExecArray | null;
     while ((m = stmtRegex.exec(body)) !== null) {
       const elemType = m[1]!;
@@ -199,6 +203,11 @@ export class MyBatisExtractor {
       if (!idMatch) continue;
       const id = idMatch[2]!;
       const absoluteIndex = bodyStart + m.index;
+      // Length of the opening tag (`<elem attrs>` = 1 + name + attrs + 1),
+      // computed from the tag itself rather than by subtracting the close tag —
+      // so the `<include>` offset below stays correct even when the close tag
+      // carries trailing whitespace (`</select >`).
+      const openTagLen = elemType.length + attrs.length + 2;
       const startLine = this.getLineNumber(absoluteIndex);
       const endLine = this.getLineNumber(absoluteIndex + m[0].length);
       const { qualifiedName: qualified, name } = this.qualifyStatement(namespace, id);
@@ -241,7 +250,7 @@ export class MyBatisExtractor {
           : namespace
             ? `${namespace}::${refid}`
             : refid;
-        const includeOffset = absoluteIndex + (m[0].length - m[3]!.length - `</${elemType}>`.length) + inc.index;
+        const includeOffset = absoluteIndex + openTagLen + inc.index;
         const line = this.getLineNumber(includeOffset);
         this.unresolvedReferences.push({
           fromNodeId: nodeId,

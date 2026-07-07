@@ -216,3 +216,33 @@ describe('iBatis 2 <sqlMap> coverage (#1182 gap 3)', () => {
     expect(methodNodes(xml, 'SqlMapConfig.xml')).toHaveLength(0);
   });
 });
+
+// A close tag is `</name S? >` in XML — the name may be followed by whitespace
+// before `>`. Legacy / hand-edited mapper XML sometimes has it. Without
+// tolerating it, the non-greedy body scan overshoots to the next real close and
+// swallows the statement in between (silent statement loss).
+describe('MyBatis extractor — whitespace in close tags', () => {
+  it('does not swallow the next statement when a close tag has trailing space', () => {
+    const xml =
+      '<mapper namespace="com.example.FooMapper">' +
+      '<select id="a">SELECT 1</select >' +
+      '<select id="b">SELECT 2</select>' +
+      '</mapper>';
+    expect(methodNames(xml).sort()).toEqual([
+      'com.example.FooMapper::a',
+      'com.example.FooMapper::b',
+    ]);
+  });
+
+  it('still resolves the include after a spaced close tag', () => {
+    const xml =
+      '<mapper namespace="com.example.FooMapper">' +
+      '<sql id="cols">id</sql>' +
+      '<select id="a">SELECT <include refid="cols"/> FROM t</select >' +
+      '</mapper>';
+    const refs = extractFromSource('FooMapper.xml', xml).unresolvedReferences.map(
+      (r) => r.referenceName
+    );
+    expect(refs).toContain('com.example.FooMapper::cols');
+  });
+});
