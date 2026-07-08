@@ -29,6 +29,7 @@ import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { SpringBeansExtractor, isSpringBeansXml } from './spring-beans-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import {
   getAllFrameworkResolvers,
@@ -6549,10 +6550,19 @@ export function extractFromSource(
     const extractor = new RazorExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'xml') {
-    // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
-    // file node so the watcher tracks it without emitting symbols.
-    const extractor = new MyBatisExtractor(filePath, source);
-    result = extractor.extract();
+    // Root-tag routing: a Spring `<beans>` document (bare or declaring the
+    // springframework schema — the root tag name is always literally
+    // `beans` either way) goes to the Spring beans extractor; everything
+    // else (MyBatis `<mapper>`/`<sqlMap>`, or any other XML) keeps going
+    // through MyBatisExtractor, which itself falls back to a file-node-only
+    // result for non-mapper XML (pom.xml, web.xml, log4j.xml, …).
+    if (isSpringBeansXml(source)) {
+      const extractor = new SpringBeansExtractor(filePath, source);
+      result = extractor.extract();
+    } else {
+      const extractor = new MyBatisExtractor(filePath, source);
+      result = extractor.extract();
+    }
   } else if (detectedLanguage === 'cfml' || detectedLanguage === 'cfscript') {
     // Custom extractor for CFML (.cfc/.cfm) — dialect-switches between the
     // tag-based cfml grammar and the bare-script cfscript grammar. Standalone

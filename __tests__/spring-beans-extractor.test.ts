@@ -1,0 +1,400 @@
+import { describe, it, expect } from 'vitest';
+import { extractFromSource } from '../src/extraction/tree-sitter';
+import type { UnresolvedReference, Node } from '../src/types';
+
+// Spring beans XML extractor. Modeled on mybatis-extractor-robustness.test.ts's
+// conventions (extractFromSource, synthetic com.example.* fixtures). Covers
+// routing, bean-node extraction (incl. anonymous/inner/nested-profile), the
+// headline bean->class `instantiates` edge, every bean->bean `references`
+// channel (incl. collection recursion and the Quartz `<list><ref>` shape),
+// alias resolution, `<import>`, the shared leniency contract with MyBatis,
+// id-bearing NamespacedElement (jee/util) nodes, and negatives.
+
+const result = (xml: string, file = 'applicationContext.xml') => extractFromSource(file, xml);
+
+const beanNodes = (xml: string, file = 'applicationContext.xml'): Node[] =>
+  result(xml, file).nodes.filter((n) => n.kind === 'variable');
+
+const refs = (xml: string, file = 'applicationContext.xml'): UnresolvedReference[] =>
+  result(xml, file).unresolvedReferences;
+
+const beanByName = (xml: string, name: string, file = 'applicationContext.xml'): Node | undefined =>
+  beanNodes(xml, file).find((n) => n.name === name);
+
+/** references-kind refs whose fromNodeId is the given bean's node id. */
+const refsFrom = (xml: string, fromId: string, file = 'applicationContext.xml'): UnresolvedReference[] =>
+  refs(xml, file).filter((r) => r.fromNodeId === fromId && r.referenceKind === 'references');
+
+describe('Spring beans extractor — routing', () => {
+  it('routes a <beans> root to the Spring beans extractor (variable nodes, no method nodes)', () => {
+    const xml = '<beans><bean id="foo" class="com.example.Foo"/></beans>';
+    const r = result(xml);
+    expect(r.nodes.some((n) => n.kind === 'variable' && n.name === 'foo')).toBe(true);
+    expect(r.nodes.some((n) => n.kind === 'method')).toBe(false);
+  });
+
+  it('still routes a <mapper namespace> root to MyBatis (method nodes, no variable nodes)', () => {
+    const xml =
+      '<mapper namespace="com.example.FooMapper">' +
+      '<select id="getById">SELECT 1</select></mapper>';
+    const r = result(xml, 'FooMapper.xml');
+    expect(r.nodes.some((n) => n.kind === 'method' && n.name === 'getById')).toBe(true);
+    expect(r.nodes.some((n) => n.kind === 'variable')).toBe(false);
+  });
+
+  it('leaves non-mapper, non-beans XML (pom.xml) with only a file node', () => {
+    const xml = '<project><groupId>x</groupId><artifactId>y</artifactId></project>\n';
+    const r = result(xml, 'pom.xml');
+    expect(r.nodes).toHaveLength(1);
+    expect(r.nodes[0]!.kind).toBe('file');
+  });
+
+  it('routes a bare <beans> root (no springframework xmlns) the same as a schema-declaring one', () => {
+    const xml =
+      '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      '<beans xmlns="http://www.springframework.org/schema/beans">' +
+      '<bean id="foo" class="com.example.Foo"/></beans>';
+    expect(beanByName(xml, 'foo')).toBeDefined();
+  });
+});
+
+describe('Spring beans extractor — bean node extraction', () => {
+  it('names a bean node by id', () => {
+    const bean = beanByName('<beans><bean id="fooService" class="com.example.FooServiceImpl"/></beans>', 'fooService');
+    expect(bean).toBeDefined();
+    expect(bean!.qualifiedName).toBe('fooService');
+    expect(bean!.language).toBe('xml');
+  });
+
+  it('falls back to the first name= token when id is absent', () => {
+    const xml = '<beans><bean name="primary,alt1 alt2" class="com.example.X"/></beans>';
+    expect(beanByName(xml, 'primary')).toBeDefined();
+    expect(beanByName(xml, 'alt1')).toBeUndefined();
+  });
+
+  it('names an id-less, name-less bean by its class in <Simple$anon@line> form', () => {
+    const xml = '<beans>\n<bean class="com.example.Anonymous"/>\n</beans>';
+    const anon = beanNodes(xml).find((n) => n.name.startsWith('<Anonymous$anon@'));
+    expect(anon).toBeDefined();
+    expect(anon!.name).toBe('<Anonymous$anon@2>');
+  });
+
+  it('emits no node for a <bean> with neither name/id nor class', () => {
+    const xml = '<beans><bean parent="base"/></beans>';
+    expect(beanNodes(xml)).toHaveLength(0);
+  });
+
+  it('recurses into an inner (constructor-arg) bean and links it to its outer bean via contains', () => {
+    const xml =
+      '<beans>' +
+      '<bean id="outer" class="com.example.Outer">' +
+      '<constructor-arg><bean class="com.example.Inner"/></constructor-arg>' +
+      '</bean></beans>';
+    const outer = beanByName(xml, 'outer');
+    const inner = beanNodes(xml).find((n) => n.name.startsWith('<Inner$anon@'));
+    expect(outer).toBeDefined();
+    expect(inner).toBeDefined();
+    const r = result(xml);
+    expect(
+      r.edges.some((e) => e.kind === 'contains' && e.source === outer!.id && e.target === inner!.id)
+    ).toBe(true);
+  });
+
+  it('extracts beans nested inside a <beans profile="…"> block, contained by the file (no profile node)', () => {
+    const xml = '<beans><beans profile="dev"><bean id="devBean" class="com.example.Dev"/></beans></beans>';
+    const devBean = beanByName(xml, 'devBean');
+    expect(devBean).toBeDefined();
+    const r = result(xml);
+    const fileNode = r.nodes.find((n) => n.kind === 'file')!;
+    expect(
+      r.edges.some((e) => e.kind === 'contains' && e.source === fileNode.id && e.target === devBean!.id)
+    ).toBe(true);
+  });
+});
+
+describe('Spring beans extractor — bean→class instantiates edge (headline)', () => {
+  it('emits an instantiates unresolvedReference in Java-qualifiedName shape (package::Class)', () => {
+    const xml = '<beans><bean id="fooService" class="com.example.service.FooServiceImpl"/></beans>';
+    const bean = beanByName(xml, 'fooService')!;
+    const r = refs(xml).filter((x) => x.fromNodeId === bean.id && x.referenceKind === 'instantiates');
+    expect(r).toHaveLength(1);
+    // NOT the raw dotted FQN — converted so it exact-matches the Java
+    // extractor's own `<dotted.package>::<ClassName>` qualifiedName shape.
+    expect(r[0]!.referenceName).toBe('com.example.service::FooServiceImpl');
+  });
+
+  it('emits instantiates for a bare (package-less) class name unchanged', () => {
+    const xml = '<beans><bean id="x" class="TopLevelBean"/></beans>';
+    const bean = beanByName(xml, 'x')!;
+    const r = refs(xml).filter((x) => x.fromNodeId === bean.id && x.referenceKind === 'instantiates');
+    expect(r[0]!.referenceName).toBe('TopLevelBean');
+  });
+
+  it('treats class="" as absent — no instantiates reference, but the bean node still exists (id present)', () => {
+    const xml = '<beans><bean id="x" class=""/></beans>';
+    const bean = beanByName(xml, 'x');
+    expect(bean).toBeDefined();
+    expect(refs(xml).some((r) => r.referenceKind === 'instantiates')).toBe(false);
+  });
+});
+
+describe('Spring beans extractor — bean→bean references channels', () => {
+  it('property ref=', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A"><property name="dep" ref="b"/></bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    expect(refsFrom(xml, a.id).map((r) => r.referenceName)).toContain('b');
+  });
+
+  it('constructor-arg ref=', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A"><constructor-arg ref="b"/></bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    expect(refsFrom(xml, a.id).map((r) => r.referenceName)).toContain('b');
+  });
+
+  it('<ref bean="…">', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A"><property name="dep"><ref bean="b"/></property></bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    expect(refsFrom(xml, a.id).map((r) => r.referenceName)).toContain('b');
+  });
+
+  it('<ref local="…"> (legacy form)', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A"><property name="dep"><ref local="b"/></property></bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    expect(refsFrom(xml, a.id).map((r) => r.referenceName)).toContain('b');
+  });
+
+  it('<idref bean="…">', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A"><property name="depName"><idref bean="b"/></property></bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    expect(refsFrom(xml, a.id).map((r) => r.referenceName)).toContain('b');
+  });
+
+  it('parent=', () => {
+    const xml = '<beans><bean id="a" class="com.example.A" parent="base"/></beans>';
+    const a = beanByName(xml, 'a')!;
+    expect(refsFrom(xml, a.id).map((r) => r.referenceName)).toContain('base');
+  });
+
+  it('depends-on= (comma/semicolon/whitespace separated)', () => {
+    const xml = '<beans><bean id="a" class="com.example.A" depends-on="b, c;d e"/></beans>';
+    const a = beanByName(xml, 'a')!;
+    const names = refsFrom(xml, a.id).map((r) => r.referenceName);
+    expect(names).toEqual(expect.arrayContaining(['b', 'c', 'd', 'e']));
+  });
+
+  it('factory-bean=', () => {
+    const xml = '<beans><bean id="a" factory-bean="factory" factory-method="create"/></beans>';
+    const a = beanByName(xml, 'a')!;
+    expect(refsFrom(xml, a.id).map((r) => r.referenceName)).toContain('factory');
+  });
+
+  it('strips a leading & (factory-bean dereference marker) from a ref value', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A"><property name="dep" ref="&factoryBean"/></bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    expect(refsFrom(xml, a.id).map((r) => r.referenceName)).toContain('factoryBean');
+  });
+
+  it('p:*-ref and c:*-ref via the conventional prefix (no xmlns:p/c declared)', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A" p:service-ref="svc" c:helper-ref="hlp"/></beans>';
+    const a = beanByName(xml, 'a')!;
+    const names = refsFrom(xml, a.id).map((r) => r.referenceName);
+    expect(names).toEqual(expect.arrayContaining(['svc', 'hlp']));
+  });
+
+  it('p:*-ref via a declared, non-conventional xmlns prefix', () => {
+    const xml =
+      '<beans xmlns:pp="http://www.springframework.org/schema/p">' +
+      '<bean id="a" class="com.example.A" pp:service-ref="svc"/></beans>';
+    const a = beanByName(xml, 'a')!;
+    expect(refsFrom(xml, a.id).map((r) => r.referenceName)).toContain('svc');
+  });
+
+  it('lookup-method@bean', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A"><lookup-method name="getX" bean="b"/></bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    expect(refsFrom(xml, a.id).map((r) => r.referenceName)).toContain('b');
+  });
+
+  it('replaced-method@replacer', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A"><replaced-method name="doIt" replacer="b"/></bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    expect(refsFrom(xml, a.id).map((r) => r.referenceName)).toContain('b');
+  });
+
+  it('<map><entry key-ref= value-ref=>', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A"><property name="m">' +
+      '<map><entry key-ref="k" value-ref="v"/></map>' +
+      '</property></bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    const names = refsFrom(xml, a.id).map((r) => r.referenceName);
+    expect(names).toEqual(expect.arrayContaining(['k', 'v']));
+  });
+
+  it('<set>/<array> containing <ref>', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A">' +
+      '<property name="s"><set><ref bean="s1"/></set></property>' +
+      '<property name="arr"><array><ref bean="a1"/></array></property>' +
+      '</bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    const names = refsFrom(xml, a.id).map((r) => r.referenceName);
+    expect(names).toEqual(expect.arrayContaining(['s1', 'a1']));
+  });
+
+  it('<props> is skipped (literal key/value, never a ref channel)', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A"><property name="cfg">' +
+      '<props><prop key="x">val</prop></props>' +
+      '</property></bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    expect(refsFrom(xml, a.id)).toHaveLength(0);
+  });
+
+  it('Quartz-shaped <property><list><ref/></list></property> (collection recursion, the load-bearing case)', () => {
+    const xml =
+      '<beans>' +
+      '<bean id="cronTrigger" class="org.springframework.scheduling.quartz.CronTriggerFactoryBean"/>' +
+      '<bean id="scheduler" class="com.example.SchedulerFactory">' +
+      '<property name="triggers"><list><ref bean="cronTrigger"/></list></property>' +
+      '</bean></beans>';
+    const scheduler = beanByName(xml, 'scheduler')!;
+    expect(refsFrom(xml, scheduler.id).map((r) => r.referenceName)).toContain('cronTrigger');
+  });
+
+  it('a <ref> nested inside an inner (anonymous) bean is scoped to the inner bean, not the outer one', () => {
+    const xml =
+      '<beans><bean id="outer" class="com.example.Outer">' +
+      '<property name="inner">' +
+      '<bean class="com.example.Inner"><property name="dep" ref="deep"/></bean>' +
+      '</property></bean></beans>';
+    const outer = beanByName(xml, 'outer')!;
+    const inner = beanNodes(xml).find((n) => n.name.startsWith('<Inner$anon@'))!;
+    expect(refsFrom(xml, inner.id).map((r) => r.referenceName)).toContain('deep');
+    expect(refsFrom(xml, outer.id).map((r) => r.referenceName)).not.toContain('deep');
+  });
+});
+
+describe('Spring beans extractor — <alias>', () => {
+  it('emits a resolvable alias node with a references edge to the target bean name', () => {
+    const xml = '<beans><bean id="fooService" class="com.example.Foo"/><alias name="fooService" alias="foo"/></beans>';
+    const aliasNode = beanByName(xml, 'foo');
+    expect(aliasNode).toBeDefined();
+    expect(aliasNode!.qualifiedName).toBe('foo');
+    const r = refs(xml).find((x) => x.fromNodeId === aliasNode!.id && x.referenceKind === 'references');
+    expect(r?.referenceName).toBe('fooService');
+  });
+
+  it('drops a malformed <alias> missing name or alias without emitting a node', () => {
+    const xml = '<beans><alias alias="onlyAlias"/><alias name="onlyName"/></beans>';
+    expect(beanNodes(xml)).toHaveLength(0);
+  });
+});
+
+describe('Spring beans extractor — <import>', () => {
+  it('emits an imports reference from the file node with the raw resource string', () => {
+    const xml = '<beans><import resource="classpath:other-context.xml"/></beans>';
+    const r = result(xml);
+    const fileNode = r.nodes.find((n) => n.kind === 'file')!;
+    const imp = r.unresolvedReferences.find((x) => x.referenceKind === 'imports');
+    expect(imp).toBeDefined();
+    expect(imp!.fromNodeId).toBe(fileNode.id);
+    expect(imp!.referenceName).toBe('classpath:other-context.xml');
+  });
+});
+
+describe('Spring beans extractor — id-bearing NamespacedElements (jee/util)', () => {
+  const xml =
+    '<beans xmlns:jee="http://www.springframework.org/schema/jee" xmlns:util="http://www.springframework.org/schema/util">' +
+    '<jee:jndi-lookup id="dataSource" jndi-name="java:comp/env/jdbc/MyDB"/>' +
+    '<util:list id="triggers"><ref bean="cronTrigger"/></util:list>' +
+    '<bean id="repo" class="com.example.Repo"><property name="dataSource" ref="dataSource"/></bean>' +
+    '</beans>';
+
+  it('emits a bean-like node for <jee:jndi-lookup id=…> so ref="dataSource" resolves', () => {
+    const dataSource = beanByName(xml, 'dataSource');
+    expect(dataSource).toBeDefined();
+    const repo = beanByName(xml, 'repo')!;
+    expect(refsFrom(xml, repo.id).map((r) => r.referenceName)).toContain('dataSource');
+  });
+
+  it('emits a bean-like node for <util:list id=…>', () => {
+    expect(beanByName(xml, 'triggers')).toBeDefined();
+  });
+
+  it('does NOT recurse into a NamespacedElement\'s contents for refs (documented v1 blind spot)', () => {
+    const triggers = beanByName(xml, 'triggers')!;
+    expect(refsFrom(xml, triggers.id)).toHaveLength(0);
+  });
+});
+
+describe('Spring beans extractor — leniency (shared contract with MyBatis)', () => {
+  it('does not emit a node for a commented-out <bean>', () => {
+    const xml = '<beans><!-- <bean id="dead" class="com.example.Dead"/> --><bean id="live" class="com.example.Live"/></beans>';
+    expect(beanByName(xml, 'dead')).toBeUndefined();
+    expect(beanByName(xml, 'live')).toBeDefined();
+  });
+
+  it('accepts single-quoted attributes', () => {
+    const xml = "<beans><bean id='fooService' class='com.example.Foo'/></beans>";
+    expect(beanByName(xml, 'fooService')).toBeDefined();
+  });
+
+  it('tolerates whitespace before the closing > of an end tag (</bean >)', () => {
+    const xml = '<beans><bean id="a" class="com.example.A"><property name="dep" ref="b"/></bean ></beans>';
+    const a = beanByName(xml, 'a');
+    expect(a).toBeDefined();
+    expect(refsFrom(xml, a!.id).map((r) => r.referenceName)).toContain('b');
+  });
+
+  it('never throws on truncated/malformed input — degrades to a file node', () => {
+    const xml = '<beans><bean id="a" class="com.example.A"';
+    expect(() => result(xml)).not.toThrow();
+    const r = result(xml);
+    expect(r.nodes.some((n) => n.kind === 'file')).toBe(true);
+  });
+
+  it('tolerates a mismatched closing tag without throwing, still extracting the bean before it', () => {
+    const xml = '<beans><bean id="a" class="com.example.A"></notbean></beans>';
+    expect(() => result(xml)).not.toThrow();
+    expect(beanByName(xml, 'a')).toBeDefined();
+  });
+
+  it('treats <!-- and --> inside CDATA as data, not comment delimiters', () => {
+    const xml =
+      '<beans><bean id="live" class="com.example.Live">' +
+      '<property name="note"><value><![CDATA[<!--not a comment-->]]></value></property>' +
+      '</bean></beans>';
+    expect(beanByName(xml, 'live')).toBeDefined();
+  });
+});
+
+describe('Spring beans extractor — negatives', () => {
+  it('never emits a reference with an empty name (ref="")', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A">' +
+      '<property name="dep" ref=""/>' +
+      '<property name="dep2" ref="b"/>' +
+      '</bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    const names = refsFrom(xml, a.id).map((r) => r.referenceName);
+    expect(names).toEqual(['b']);
+    expect(names.every((n) => n.length > 0)).toBe(true);
+  });
+
+  it('leaves ordinary (non-Spring, non-MyBatis) XML untouched by this extractor', () => {
+    const xml = '<?xml version="1.0"?><Configuration><Loggers><Root level="info"/></Loggers></Configuration>';
+    const r = result(xml, 'log4j.xml');
+    expect(r.nodes).toHaveLength(1);
+    expect(r.nodes[0]!.kind).toBe('file');
+  });
+});
