@@ -1,5 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import { extractFromSource } from '../src/extraction/tree-sitter';
+import { CodeGraph } from '../src';
 import type { UnresolvedReference, Node } from '../src/types';
 
 // Spring beans XML extractor. Modeled on mybatis-extractor-robustness.test.ts's
@@ -56,6 +60,17 @@ describe('Spring beans extractor — routing', () => {
       '<bean id="foo" class="com.example.Foo"/></beans>';
     expect(beanByName(xml, 'foo')).toBeDefined();
   });
+
+  it('routes a prefixed <beans:beans> root (Spring Security style) and resolves prefixed <beans:ref>', () => {
+    const xml =
+      '<beans:beans xmlns:beans="http://www.springframework.org/schema/beans">' +
+      '<beans:bean id="a" class="com.example.A">' +
+      '<beans:property name="dep"><beans:ref bean="b"/></beans:property>' +
+      '</beans:bean></beans:beans>';
+    const a = beanByName(xml, 'a');
+    expect(a).toBeDefined();
+    expect(refsFrom(xml, a!.id).map((r) => r.referenceName)).toContain('b');
+  });
 });
 
 describe('Spring beans extractor — bean node extraction', () => {
@@ -69,7 +84,18 @@ describe('Spring beans extractor — bean node extraction', () => {
   it('falls back to the first name= token when id is absent', () => {
     const xml = '<beans><bean name="primary,alt1 alt2" class="com.example.X"/></beans>';
     expect(beanByName(xml, 'primary')).toBeDefined();
-    expect(beanByName(xml, 'alt1')).toBeUndefined();
+    expect(beanByName(xml, 'alt1')).toBeDefined();
+  });
+
+  it('registers every name= token as a resolvable secondary name (id ∪ names ∪ alias contract)', () => {
+    const xml = '<beans><bean id="foo" name="alt1, alt2" class="com.example.X"/></beans>';
+    const alt1 = beanByName(xml, 'alt1');
+    const alt2 = beanByName(xml, 'alt2');
+    expect(alt1).toBeDefined();
+    expect(alt2).toBeDefined();
+    const r = refs(xml);
+    expect(r.some((x) => x.fromNodeId === alt1!.id && x.referenceKind === 'references' && x.referenceName === 'foo')).toBe(true);
+    expect(r.some((x) => x.fromNodeId === alt2!.id && x.referenceKind === 'references' && x.referenceName === 'foo')).toBe(true);
   });
 
   it('names an id-less, name-less bean by its class in <Simple$anon@line> form', () => {
@@ -79,9 +105,16 @@ describe('Spring beans extractor — bean node extraction', () => {
     expect(anon!.name).toBe('<Anonymous$anon@2>');
   });
 
-  it('emits no node for a <bean> with neither name/id nor class', () => {
-    const xml = '<beans><bean parent="base"/></beans>';
+  it('emits no node for a <bean> with neither name/id/class nor parent/factory-bean', () => {
+    const xml = '<beans><bean/></beans>';
     expect(beanNodes(xml)).toHaveLength(0);
+  });
+
+  it('still emits an anon node for a top-level <bean parent="…"> (no id/name/class) so the parent ref is not dropped', () => {
+    const xml = '<beans><bean parent="base"/></beans>';
+    const anon = beanNodes(xml).find((n) => n.name.startsWith('<bean$anon@'));
+    expect(anon).toBeDefined();
+    expect(refsFrom(xml, anon!.id).map((r) => r.referenceName)).toContain('base');
   });
 
   it('recurses into an inner (constructor-arg) bean and links it to its outer bean via contains', () => {
@@ -200,6 +233,15 @@ describe('Spring beans extractor — bean→bean references channels', () => {
     expect(refsFrom(xml, a.id).map((r) => r.referenceName)).toContain('factoryBean');
   });
 
+  it('decodes &amp; before stripping the factory-bean dereference marker (well-formed XML)', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A"><property name="dep" ref="&amp;factoryBean"/></bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    const names = refsFrom(xml, a.id).map((r) => r.referenceName);
+    expect(names).toContain('factoryBean');
+    expect(names).not.toContain('amp;factoryBean');
+  });
+
   it('p:*-ref and c:*-ref via the conventional prefix (no xmlns:p/c declared)', () => {
     const xml =
       '<beans><bean id="a" class="com.example.A" p:service-ref="svc" c:helper-ref="hlp"/></beans>';
@@ -301,14 +343,22 @@ describe('Spring beans extractor — <alias>', () => {
 });
 
 describe('Spring beans extractor — <import>', () => {
-  it('emits an imports reference from the file node with the raw resource string', () => {
+  it('strips the classpath: prefix so a no-slash resource resolves by basename', () => {
     const xml = '<beans><import resource="classpath:other-context.xml"/></beans>';
     const r = result(xml);
     const fileNode = r.nodes.find((n) => n.kind === 'file')!;
     const imp = r.unresolvedReferences.find((x) => x.referenceKind === 'imports');
     expect(imp).toBeDefined();
     expect(imp!.fromNodeId).toBe(fileNode.id);
-    expect(imp!.referenceName).toBe('classpath:other-context.xml');
+    expect(imp!.referenceName).toBe('other-context.xml');
+  });
+
+  it('strips classpath*: and file: prefixes too, preserving a subdirectory path', () => {
+    const xml =
+      '<beans><import resource="classpath*:context/common.xml"/>' +
+      '<import resource="file:/etc/app/extra.xml"/></beans>';
+    const names = result(xml).unresolvedReferences.filter((x) => x.referenceKind === 'imports').map((x) => x.referenceName);
+    expect(names).toEqual(expect.arrayContaining(['context/common.xml', '/etc/app/extra.xml']));
   });
 });
 
@@ -369,6 +419,22 @@ describe('Spring beans extractor — leniency (shared contract with MyBatis)', (
     expect(beanByName(xml, 'a')).toBeDefined();
   });
 
+  it('tolerates a legal > inside a quoted attribute value (SpEL) without truncating the tag or mis-nesting siblings', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A" p:expr="#{x > 3}"/><bean id="b" class="com.example.B"/></beans>';
+    const r = result(xml);
+    const fileNode = r.nodes.find((n) => n.kind === 'file')!;
+    const a = beanByName(xml, 'a');
+    const b = beanByName(xml, 'b');
+    expect(a).toBeDefined();
+    expect(b).toBeDefined();
+    // Both are top-level, self-closed beans — both contained by the file,
+    // NOT by each other (the bug this pins: a mis-parsed `>` inside the
+    // quoted value left bean `a` "open", nesting `b` inside it instead).
+    expect(r.edges.some((e) => e.kind === 'contains' && e.source === fileNode.id && e.target === a!.id)).toBe(true);
+    expect(r.edges.some((e) => e.kind === 'contains' && e.source === fileNode.id && e.target === b!.id)).toBe(true);
+  });
+
   it('treats <!-- and --> inside CDATA as data, not comment delimiters', () => {
     const xml =
       '<beans><bean id="live" class="com.example.Live">' +
@@ -396,5 +462,47 @@ describe('Spring beans extractor — negatives', () => {
     const r = result(xml, 'log4j.xml');
     expect(r.nodes).toHaveLength(1);
     expect(r.nodes[0]!.kind).toBe('file');
+  });
+});
+
+describe('Spring beans extractor — bean→class instantiates edge resolves end-to-end against a real Java node', () => {
+  let tempDir: string;
+  let cg: CodeGraph | undefined;
+
+  afterEach(() => {
+    if (cg) {
+      cg.destroy();
+      cg = undefined;
+    } else if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true });
+    }
+  });
+
+  it('resolves a <bean class="..."> instantiates reference to the actual Java class node, not just a string shape', async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-spring-beans-test-'));
+    const srcDir = path.join(tempDir, 'src', 'main', 'java', 'com', 'example', 'service');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(srcDir, 'FooServiceImpl.java'),
+      'package com.example.service;\n\npublic class FooServiceImpl {\n    public FooServiceImpl() {}\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'applicationContext.xml'),
+      '<beans><bean id="fooService" class="com.example.service.FooServiceImpl"/></beans>\n'
+    );
+
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+
+    const fooService = cg.getNodesByKind('variable').find((n) => n.name === 'fooService');
+    expect(fooService).toBeDefined();
+
+    const fooServiceImpl = cg.getNodesByKind('class').find((n) => n.name === 'FooServiceImpl');
+    expect(fooServiceImpl).toBeDefined();
+
+    const outgoing = cg.getOutgoingEdges(fooService!.id);
+    const instantiates = outgoing.find((e) => e.kind === 'instantiates');
+    expect(instantiates).toBeDefined();
+    expect(instantiates!.target).toBe(fooServiceImpl!.id);
   });
 });

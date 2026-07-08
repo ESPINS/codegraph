@@ -69,18 +69,60 @@ function stripXmlNoise(source: string): string {
   return out.join('');
 }
 
+/** Strip a namespace prefix (`beans:beans` → `beans`) for tag matching that must ignore it. */
+function localName(tag: string): string {
+  const colon = tag.indexOf(':');
+  return colon >= 0 ? tag.slice(colon + 1) : tag;
+}
+
 /**
  * Cheap, comment-aware root-tag sniff used by the tree-sitter router to
  * decide MyBatis vs Spring beans for a `.xml` file, without paying for a
  * full tree parse. XML processing instructions (`<?xml …?>`) and DOCTYPE
  * (`<!DOCTYPE …>`) never match the tag-name character class (`?`/`!` aren't
  * `[A-Za-z_]`), so the first match this regex finds is always the real root
- * element — no separate prolog-skipping logic needed.
+ * element — no separate prolog-skipping logic needed. Matched by LOCAL name
+ * (namespace prefix stripped) so a prefixed root — `<beans:beans>`, the
+ * standard shape for a Spring Security config whose default xmlns is the
+ * security schema — still routes here instead of falling through to MyBatis.
  */
 export function isSpringBeansXml(source: string): boolean {
   const stripped = stripXmlNoise(source);
   const m = /<([A-Za-z_][\w:.-]*)/.exec(stripped);
-  return !!m && m[1] === 'beans';
+  return !!m && localName(m[1]!) === 'beans';
+}
+
+/**
+ * Decode the standard XML predefined entities (`&amp; &lt; &gt; &quot;
+ * &apos;`) plus numeric character references (`&#NN;` / `&#xHH;`) in an
+ * attribute value. Well-formed XML MUST escape a literal `&` as `&amp;` —
+ * the factory-dereference marker on a ref is therefore written
+ * `ref="&amp;factoryBean"`, not a raw `&`, so without this decode step the
+ * value stays `&amp;factoryBean` and `pushRef`'s leading-`&` strip produces
+ * garbage (`amp;factoryBean`). Single left-to-right pass over the ORIGINAL
+ * text (not iterative re-scanning), so `&amp;lt;` correctly decodes to the
+ * literal text `&lt;`, never double-decodes to `<`.
+ */
+function decodeXmlEntities(value: string): string {
+  if (!value.includes('&')) return value;
+  return value.replace(/&(amp|lt|gt|quot|apos|#x[0-9A-Fa-f]+|#\d+);/g, (whole, ent: string) => {
+    switch (ent) {
+      case 'amp':
+        return '&';
+      case 'lt':
+        return '<';
+      case 'gt':
+        return '>';
+      case 'quot':
+        return '"';
+      case 'apos':
+        return "'";
+      default:
+        if (ent.startsWith('#x')) return String.fromCodePoint(parseInt(ent.slice(2), 16));
+        if (ent.startsWith('#')) return String.fromCodePoint(parseInt(ent.slice(1), 10));
+        return whole;
+    }
+  });
 }
 
 /** A lenient, generic XML element — tag name, attributes, and child elements. */
@@ -108,7 +150,7 @@ function parseAttrs(raw: string): Record<string, string> {
   const re = /([A-Za-z_][\w:.-]*)\s*=\s*(["'])([^"']*)\2/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(raw)) !== null) {
-    attrs[m[1]!] = m[3]!;
+    attrs[m[1]!] = decodeXmlEntities(m[3]!);
   }
   return attrs;
 }
@@ -169,7 +211,13 @@ const REGISTRANT_NS_PREFIXES = new Set(['util', 'jee']);
  * well-formed document only ever has one root).
  */
 class LenientXmlTreeParser {
-  private static readonly TAG_RE = /<(\/?)([A-Za-z_][\w:.-]*)([^>]*)>/g;
+  // The tag body is a repetition of "any char that isn't >, ", or '" OR a
+  // whole quoted string (either quote style) — so a `>` legally embedded in
+  // an attribute value (SpEL `p:expr="#{x > 3}"`, any p:/c: literal) stays
+  // inside its quoted alternative instead of ending the tag early. A naive
+  // `[^>]*` (the prior regex) has no quote-awareness and truncates the tag
+  // at that `>`, corrupting containment for every element after it.
+  private static readonly TAG_RE = /<(\/?)([A-Za-z_][\w:.-]*)((?:[^>"']|"[^"]*"|'[^']*')*)>/g;
 
   static parse(source: string): XmlEl | null {
     const stack: XmlEl[] = [];
@@ -263,7 +311,7 @@ export class SpringBeansExtractor {
       // constructing this extractor, but never trust it twice — malformed
       // input (or a routing edge case) degrades to file-node-only, never a
       // throw, per the leniency contract shared with MyBatis.
-      if (root && root.tag === 'beans') {
+      if (root && localName(root.tag) === 'beans') {
         this.pPrefix = this.detectNsPrefix(root.attrs, 'http://www.springframework.org/schema/p', 'p');
         this.cPrefix = this.detectNsPrefix(root.attrs, 'http://www.springframework.org/schema/c', 'c');
         this.walk(root, null, this.fileNodeId);
@@ -330,10 +378,12 @@ export class SpringBeansExtractor {
       const localTag = colon >= 0 ? tag.slice(colon + 1) : tag;
       const nsPrefix = colon >= 0 ? tag.slice(0, colon) : '';
 
-      if (tag === 'beans') {
+      if (localTag === 'beans') {
         // Nested `<beans profile="dev">` block: a fresh top-level bean scope
         // (profile semantics themselves are out of scope — see class doc),
-        // still structurally contained by the file.
+        // still structurally contained by the file. Matched by local name
+        // (like `bean` itself) so a prefixed document (`<beans:beans>`)
+        // still nests correctly.
         this.walk(child, null, containerNodeId);
         continue;
       }
@@ -355,17 +405,17 @@ export class SpringBeansExtractor {
         continue;
       }
 
-      if (tag === 'alias') {
+      if (localTag === 'alias') {
         this.emitAlias(child);
         continue;
       }
 
-      if (tag === 'import') {
+      if (localTag === 'import') {
         this.emitImport(child);
         continue;
       }
 
-      if (tag === 'ref' || tag === 'idref') {
+      if (localTag === 'ref' || localTag === 'idref') {
         // Both `<ref bean=|local=>` and `<idref bean=|local=>` name their
         // target the same way (`bean` takes priority over the older `local`
         // form); `<idref>` differs at runtime (resolves to the bean NAME,
@@ -439,19 +489,26 @@ export class SpringBeansExtractor {
    * as `name`, resolved via the generic resolver's exact-name matching.
    *
    * Returns null (no node emitted) when the bean has neither an id/name nor
-   * a class — nothing to name it by and nothing to link it to, so a node
-   * here would be exactly the "valueless leaf" the spec forbids.
+   * a class NOR a parent/factory-bean — nothing to name it by and nothing to
+   * link it to, so a node here would be exactly the "valueless leaf" the
+   * spec forbids. A `parent=`/`factory-bean=`-only anonymous bean (legal:
+   * class is inherited from the parent, or supplied entirely by the factory
+   * — e.g. a side-effecting `MethodInvokingFactoryBean`) DOES carry a link
+   * (the parent/factory-bean reference itself), so it still gets an anon
+   * node to hang that reference off of.
    */
   private emitBean(el: XmlEl, containerNodeId: string): string | null {
     const id = el.attrs.id?.trim();
     const nameAttr = el.attrs.name?.trim();
-    const firstName = nameAttr ? nameAttr.split(/[,;\s]+/).find(Boolean) : undefined;
+    const nameTokens = nameAttr ? nameAttr.split(/[,;\s]+/).filter(Boolean) : [];
+    const firstName = nameTokens[0];
     const cls = el.attrs.class?.trim();
+    const hasLinkOnly = !!(el.attrs.parent?.trim() || el.attrs['factory-bean']?.trim());
     const effectiveName = id || firstName;
-    if (!effectiveName && !cls) return null;
+    if (!effectiveName && !cls && !hasLinkOnly) return null;
 
     const line = this.getLineNumber(el.start);
-    const name = effectiveName || `<${simpleClassName(cls!)}$anon@${line}>`;
+    const name = effectiveName || (cls ? `<${simpleClassName(cls)}$anon@${line}>` : `<bean$anon@${line}>`);
     const qualifiedName = name;
     // Byte offset (not just line) folded into the id hash so two beans that
     // land on the same line (inline inner beans, several one-line `<bean/>`
@@ -486,7 +543,48 @@ export class SpringBeansExtractor {
       });
     }
 
+    // Spec name-index contract: a ref resolves against id ∪ names ∪ alias.
+    // `name=` can carry MULTIPLE space/comma/semicolon-separated tokens, and
+    // every token beyond the one already used as this node's own `name`
+    // (either because `id` won, or because it WAS the first name token) is a
+    // second registered name for the same bean — a `ref=` to any of them
+    // must resolve here too. Same two-hop synthetic-node trick `emitAlias`
+    // already uses for `<alias>`: a tiny node per extra name with a
+    // `references` edge back to the primary name.
+    for (const token of nameTokens) {
+      if (token === effectiveName) continue;
+      this.emitSecondaryName(token, name, el.start, line);
+    }
+
     return nodeId;
+  }
+
+  /** See the `nameTokens` loop in `emitBean` — one extra registered name for a bean. */
+  private emitSecondaryName(token: string, primaryName: string, startOffset: number, line: number): void {
+    const nodeId = generateNodeId(this.filePath, 'variable', token, startOffset);
+    const node: Node = {
+      id: nodeId,
+      kind: 'variable',
+      name: token,
+      qualifiedName: token,
+      filePath: this.filePath,
+      language: 'xml',
+      signature: `secondary name for "${primaryName}"`,
+      startLine: line,
+      endLine: line,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: Date.now(),
+    };
+    this.nodes.push(node);
+    this.edges.push({ source: this.fileNodeId, target: nodeId, kind: 'contains' });
+    this.unresolvedReferences.push({
+      fromNodeId: nodeId,
+      referenceName: primaryName,
+      referenceKind: 'references',
+      line,
+      column: 0,
+    });
   }
 
   /**
@@ -560,7 +658,17 @@ export class SpringBeansExtractor {
   }
 
   private emitImport(el: XmlEl): void {
-    const resource = el.attrs.resource?.trim();
+    const raw = el.attrs.resource?.trim();
+    if (!raw) return;
+    // Strip the `classpath:`/`classpath*:`/`file:` resource prefix before
+    // emitting: the resolver's file-path matcher (`matchByFilePath`) looks
+    // up file nodes by basename via `path.split('/').pop()`, so a no-slash
+    // resource like `classpath:other-context.xml` would otherwise carry the
+    // prefix INTO the "basename" (`classpath:other-context.xml`), which
+    // never matches any real file node's name and leaves the import edge
+    // permanently dangling — the common, no-subdirectory case for this
+    // reference channel.
+    const resource = raw.replace(/^classpath\*?:/, '').replace(/^file:/, '');
     if (!resource) return;
     this.unresolvedReferences.push({
       fromNodeId: this.fileNodeId,
