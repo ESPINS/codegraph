@@ -98,6 +98,12 @@ describe('Spring beans extractor — bean node extraction', () => {
     expect(r.some((x) => x.fromNodeId === alt2!.id && x.referenceKind === 'references' && x.referenceName === 'foo')).toBe(true);
   });
 
+  it('dedupes name= tokens so name="b,b" does not emit a duplicate node for "b"', () => {
+    const xml = '<beans><bean id="foo" name="b,b" class="com.example.X"/></beans>';
+    const bNodes = beanNodes(xml).filter((n) => n.name === 'b');
+    expect(bNodes).toHaveLength(1);
+  });
+
   it('names an id-less, name-less bean by its class in <Simple$anon@line> form', () => {
     const xml = '<beans>\n<bean class="com.example.Anonymous"/>\n</beans>';
     const anon = beanNodes(xml).find((n) => n.name.startsWith('<Anonymous$anon@'));
@@ -161,6 +167,13 @@ describe('Spring beans extractor — bean→class instantiates edge (headline)',
     const bean = beanByName(xml, 'x')!;
     const r = refs(xml).filter((x) => x.fromNodeId === bean.id && x.referenceKind === 'instantiates');
     expect(r[0]!.referenceName).toBe('TopLevelBean');
+  });
+
+  it('maps a static-nested-class $ separator to :: so it matches the Java extractor\'s qualifiedName shape', () => {
+    const xml = '<beans><bean id="x" class="com.example.Outer$Inner"/></beans>';
+    const bean = beanByName(xml, 'x')!;
+    const r = refs(xml).filter((x) => x.fromNodeId === bean.id && x.referenceKind === 'instantiates');
+    expect(r[0]!.referenceName).toBe('com.example::Outer::Inner');
   });
 
   it('treats class="" as absent — no instantiates reference, but the bean node still exists (id present)', () => {
@@ -240,6 +253,18 @@ describe('Spring beans extractor — bean→bean references channels', () => {
     const names = refsFrom(xml, a.id).map((r) => r.referenceName);
     expect(names).toContain('factoryBean');
     expect(names).not.toContain('amp;factoryBean');
+  });
+
+  it('guards against a String.fromCodePoint RangeError on an out-of-range numeric entity (&#x110000;), still extracting the rest of the file', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A" note="&#x110000;"/>' +
+      '<bean id="b" class="com.example.B"/></beans>';
+    expect(() => result(xml)).not.toThrow();
+    // Without the guard, the thrown RangeError escapes to extract()'s catch
+    // and degrades the whole file to file-node-only — both beans below,
+    // including the one carrying the bad entity, must still come through.
+    expect(beanByName(xml, 'a')).toBeDefined();
+    expect(beanByName(xml, 'b')).toBeDefined();
   });
 
   it('p:*-ref and c:*-ref via the conventional prefix (no xmlns:p/c declared)', () => {
@@ -504,5 +529,54 @@ describe('Spring beans extractor — bean→class instantiates edge resolves end
     const instantiates = outgoing.find((e) => e.kind === 'instantiates');
     expect(instantiates).toBeDefined();
     expect(instantiates!.target).toBe(fooServiceImpl!.id);
+  });
+});
+
+describe('Spring beans extractor — cross-file bean→bean reference resolves via CodeGraph.init', () => {
+  let tempDir: string;
+  let cg: CodeGraph | undefined;
+
+  afterEach(() => {
+    if (cg) {
+      cg.destroy();
+      cg = undefined;
+    } else if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true });
+    }
+  });
+
+  it('resolves a <property ref="…"> in one XML file to the bean declared in a sibling XML file', async () => {
+    // Pins the design note on `emitBean`: qualifiedName is deliberately just
+    // the bean name (unscoped by file path), because one ApplicationContext
+    // is commonly assembled from many XML files — a ref in file A must
+    // resolve to a bean declared in file B, not dangle just because they're
+    // different files.
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-spring-beans-cross-file-'));
+    fs.writeFileSync(
+      path.join(tempDir, 'service-context.xml'),
+      '<beans><bean id="svc" class="com.example.ServiceImpl">' +
+        '<property name="repo" ref="repo"/></bean></beans>\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'repo-context.xml'),
+      '<beans><bean id="repo" class="com.example.RepoImpl"/></beans>\n'
+    );
+
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+
+    const svc = cg.getNodesByKind('variable').find((n) => n.name === 'svc');
+    const repo = cg.getNodesByKind('variable').find((n) => n.name === 'repo');
+    expect(svc).toBeDefined();
+    expect(repo).toBeDefined();
+    // The two beans live in different files — repo-context.xml, not
+    // service-context.xml — so this only passes if resolution found the
+    // cross-file match, not just a same-file one.
+    expect(repo!.filePath).toBe('repo-context.xml');
+    expect(svc!.filePath).toBe('service-context.xml');
+
+    const outgoing = cg.getOutgoingEdges(svc!.id);
+    const referenceEdge = outgoing.find((e) => e.kind === 'references' && e.target === repo!.id);
+    expect(referenceEdge).toBeDefined();
   });
 });

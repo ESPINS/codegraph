@@ -14,19 +14,20 @@ import { generateNodeId } from './tree-sitter-helpers';
  * profile="…">` wrapping another batch of beans), so this extractor instead
  * builds a small lenient tag tree (see `parseTree`) and walks it recursively.
  *
- * The design subset extracted here — which nodes are worth a row, which
- * attributes/elements carry a reference, and what's deliberately left out —
- * comes from the beans-xml parser spec's "codegraph 적용 매핑" section
- * (repos/beans-xml/docs/specs/spec-beans-xml.md): bean nodes (recursively,
- * including nested-profile and inner/collection beans), id-bearing
- * NamespacedElements that register beans (`jee:jndi-lookup`, `util:*`), the
- * bean→class `instantiates` edge (the headline bridge to Java), and the full
- * bean→bean `references` channel (property/constructor-arg ref, `<ref>`/
- * `<idref>` anywhere in a collection or inner bean, parent/depends-on/
- * factory-bean, p:/c: namespace `-ref` attributes, method injection). Same
- * philosophy as MyBatis: only "this bean gets used" links, not full Spring
- * config fidelity (scope/lifecycle/component-scan/aop/tx are out of scope —
- * see the class-level exclusions noted inline below).
+ * v1 scope, per the beans-xml parser spec's "codegraph 적용 매핑" section
+ * (repos/beans-xml/docs/specs/spec-beans-xml.md). Implemented: bean nodes
+ * (recursively, incl. nested-profile and inner/collection beans), id-bearing
+ * NamespacedElement registrants (`jee:jndi-lookup`, `util:*`), the bean→class
+ * `instantiates` edge, and these bean→bean `references` channels:
+ * property/constructor-arg `ref=`, `<ref>`/`<idref>` anywhere in a
+ * collection or inner bean, `parent=`/`depends-on=`/`factory-bean=`, p:/c:
+ * namespace `-ref` attributes, and lookup-method/replaced-method injection.
+ * Deliberately EXCLUDED from v1 (not "full" per the spec's mapping): SpEL
+ * `#{bean}` refs; ref-harvesting the contents of other NamespacedElements
+ * (aop/tx/task/jee beyond the id registration itself); and the spec's three
+ * blind-spot promotions — ⑴ `*BeanName`-suffixed by-name refs, ⑵
+ * mapperLocations/configLocation file-edge promotion (the future
+ * Spring↔MyBatis bridge), ⑶ jobClass/targetClass by-value FQNs.
  */
 
 // ---------------------------------------------------------------------------
@@ -118,11 +119,31 @@ function decodeXmlEntities(value: string): string {
       case 'apos':
         return "'";
       default:
-        if (ent.startsWith('#x')) return String.fromCodePoint(parseInt(ent.slice(2), 16));
-        if (ent.startsWith('#')) return String.fromCodePoint(parseInt(ent.slice(1), 10));
+        if (ent.startsWith('#x')) return decodeNumericEntity(parseInt(ent.slice(2), 16), whole);
+        if (ent.startsWith('#')) return decodeNumericEntity(parseInt(ent.slice(1), 10), whole);
         return whole;
     }
   });
+}
+
+/**
+ * `String.fromCodePoint` throws a RangeError for anything outside the valid
+ * Unicode range (`0`–`0x10FFFF`) or a non-finite/NaN input (a malformed
+ * `&#…;`/`&#x…;` reference). Left unguarded, that throw escapes all the way
+ * up through `decodeXmlEntities` → `parseAttrs` → the tree parser into
+ * `extract()`'s catch, which degrades the ENTIRE file to file-node-only —
+ * one bad numeric entity anywhere in a large file would otherwise wipe out
+ * every real bean in it. So: validate first, and try/catch as a belt-and-
+ * suspenders backstop; either way an invalid entity just falls back to its
+ * raw source text (`whole`, e.g. `&#x110000;`) and extraction continues.
+ */
+function decodeNumericEntity(codePoint: number, whole: string): string {
+  if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) return whole;
+  try {
+    return String.fromCodePoint(codePoint);
+  } catch {
+    return whole;
+  }
 }
 
 /** A lenient, generic XML element — tag name, attributes, and child elements. */
@@ -179,8 +200,13 @@ function simpleClassName(fqn: string): string {
 function javaFqnToQualifiedName(fqn: string): string {
   const trimmed = fqn.trim();
   const dot = trimmed.lastIndexOf('.');
-  if (dot < 0) return trimmed;
-  return `${trimmed.slice(0, dot)}::${trimmed.slice(dot + 1)}`;
+  const base = dot < 0 ? trimmed : `${trimmed.slice(0, dot)}::${trimmed.slice(dot + 1)}`;
+  // A static nested class is written `Outer$Inner` in a `class=` attribute
+  // (binary-name form) but the Java extractor's qualifiedName nests it as
+  // `Outer::Inner` (same `::` separator as the package/class boundary
+  // above) — map every `$` the same way so `com.example.Outer$Inner`
+  // resolves to `com.example::Outer::Inner`.
+  return base.replace(/\$/g, '::');
 }
 
 /**
@@ -500,7 +526,12 @@ export class SpringBeansExtractor {
   private emitBean(el: XmlEl, containerNodeId: string): string | null {
     const id = el.attrs.id?.trim();
     const nameAttr = el.attrs.name?.trim();
-    const nameTokens = nameAttr ? nameAttr.split(/[,;\s]+/).filter(Boolean) : [];
+    // Deduped via Set (insertion order preserved) — a repeated token
+    // (`name="b,b"`) would otherwise walk the `nameTokens` loop below twice
+    // for the same name, emitting two node objects that hash to the exact
+    // same id (`generateNodeId` is a pure function of file/kind/name/line),
+    // i.e. a literal duplicate row rather than a harmless no-op.
+    const nameTokens = nameAttr ? [...new Set(nameAttr.split(/[,;\s]+/).filter(Boolean))] : [];
     const firstName = nameTokens[0];
     const cls = el.attrs.class?.trim();
     const hasLinkOnly = !!(el.attrs.parent?.trim() || el.attrs['factory-bean']?.trim());
