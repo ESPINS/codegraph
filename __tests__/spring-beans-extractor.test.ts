@@ -351,6 +351,126 @@ describe('Spring beans extractor — bean→bean references channels', () => {
   });
 });
 
+describe('Spring beans extractor — by-value class promotion (blind spot ⑶: jobClass/targetClass/…)', () => {
+  it('promotes <property name="jobClass" value="…"> (attribute value form, the classic Quartz shape)', () => {
+    const xml =
+      '<beans><bean id="job" class="org.springframework.scheduling.quartz.JobDetailFactoryBean">' +
+      '<property name="jobClass" value="com.example.job.SyncJob"/>' +
+      '</bean></beans>';
+    const job = beanByName(xml, 'job')!;
+    const r = refs(xml).filter((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates');
+    expect(r.map((x) => x.referenceName)).toContain('com.example.job::SyncJob');
+  });
+
+  it('promotes "targetClass" the same way', () => {
+    const xml =
+      '<beans><bean id="proxy" class="com.example.ProxyFactory">' +
+      '<property name="targetClass" value="com.example.service.RealService"/>' +
+      '</bean></beans>';
+    const proxy = beanByName(xml, 'proxy')!;
+    const r = refs(xml).filter((x) => x.fromNodeId === proxy.id && x.referenceKind === 'instantiates');
+    expect(r.map((x) => x.referenceName)).toContain('com.example.service::RealService');
+  });
+
+  it('promotes "driverClassName" (the JDBC by-string-configuration shape)', () => {
+    const xml =
+      '<beans><bean id="ds" class="com.example.pool.PoolingDataSource">' +
+      '<property name="driverClassName" value="com.example.jdbc.Driver"/>' +
+      '</bean></beans>';
+    const ds = beanByName(xml, 'ds')!;
+    const r = refs(xml).filter((x) => x.fromNodeId === ds.id && x.referenceKind === 'instantiates');
+    expect(r.map((x) => x.referenceName)).toContain('com.example.jdbc::Driver');
+  });
+
+  it('promotes the <constructor-arg name="…" value="…"> form', () => {
+    const xml =
+      '<beans><bean id="job" class="com.example.JobHolder">' +
+      '<constructor-arg name="jobClass" value="com.example.job.SyncJob"/>' +
+      '</bean></beans>';
+    const job = beanByName(xml, 'job')!;
+    const r = refs(xml).filter((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates');
+    expect(r.map((x) => x.referenceName)).toContain('com.example.job::SyncJob');
+  });
+
+  it('promotes the <value>text</value> child-element form (no value= attribute)', () => {
+    const xml =
+      '<beans><bean id="job" class="org.springframework.scheduling.quartz.JobDetailFactoryBean">' +
+      '<property name="jobClass"><value>com.example.job.SyncJob</value></property>' +
+      '</bean></beans>';
+    const job = beanByName(xml, 'job')!;
+    const r = refs(xml).filter((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates');
+    expect(r.map((x) => x.referenceName)).toContain('com.example.job::SyncJob');
+  });
+
+  it('promotes the p-namespace literal form (p:jobClass="…")', () => {
+    const xml = '<beans><bean id="job" class="com.example.JobHolder" p:jobClass="com.example.job.SyncJob"/></beans>';
+    const job = beanByName(xml, 'job')!;
+    const r = refs(xml).filter((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates');
+    expect(r.map((x) => x.referenceName)).toContain('com.example.job::SyncJob');
+  });
+
+  it('maps a static-nested-class $ separator via the same javaFqnToQualifiedName mapping', () => {
+    const xml =
+      '<beans><bean id="job" class="com.example.JobHolder">' +
+      '<property name="jobClass" value="com.example.Outer$Inner"/>' +
+      '</bean></beans>';
+    const job = beanByName(xml, 'job')!;
+    const r = refs(xml).filter((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates');
+    expect(r.map((x) => x.referenceName)).toContain('com.example::Outer::Inner');
+  });
+
+  // Every negative below uses a bean WITHOUT its own `class=` attribute
+  // (id-only, `parent=`-anchored) so the promotion channel under test is the
+  // ONLY possible source of an `instantiates` reference — an unguarded
+  // `class="com.example.JobHolder"` on the bean itself would otherwise emit
+  // its own headline instantiates ref and mask a promotion bug as a pass.
+
+  it('does NOT promote a ${placeholder} value', () => {
+    const xml =
+      '<beans><bean id="job" parent="jobBase">' +
+      '<property name="jobClass" value="${job.class}"/>' +
+      '</bean></beans>';
+    const job = beanByName(xml, 'job')!;
+    expect(refs(xml).some((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates')).toBe(false);
+  });
+
+  it('does NOT promote a single-segment (non-FQN-shaped) value', () => {
+    const xml =
+      '<beans><bean id="job" parent="jobBase">' +
+      '<property name="jobClass" value="SyncJob"/>' +
+      '</bean></beans>';
+    const job = beanByName(xml, 'job')!;
+    expect(refs(xml).some((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates')).toBe(false);
+  });
+
+  it('does NOT promote a non-*Class/*ClassName property name, even with an FQN-shaped value', () => {
+    const xml =
+      '<beans><bean id="job" parent="jobBase">' +
+      '<property name="jobDescription" value="com.example.job.SyncJob"/>' +
+      '</bean></beans>';
+    const job = beanByName(xml, 'job')!;
+    expect(refs(xml).some((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates')).toBe(false);
+  });
+
+  it('does NOT promote an all-lowercase "superclass"-shaped name (no camelCase boundary into "Class")', () => {
+    const xml =
+      '<beans><bean id="job" parent="jobBase">' +
+      '<property name="superclass" value="com.example.job.SyncJob"/>' +
+      '</bean></beans>';
+    const job = beanByName(xml, 'job')!;
+    expect(refs(xml).some((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates')).toBe(false);
+  });
+
+  it('does NOT promote an empty value', () => {
+    const xml =
+      '<beans><bean id="job" parent="jobBase">' +
+      '<property name="jobClass" value=""/>' +
+      '</bean></beans>';
+    const job = beanByName(xml, 'job')!;
+    expect(refs(xml).some((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates')).toBe(false);
+  });
+});
+
 describe('Spring beans extractor — <alias>', () => {
   it('emits a resolvable alias node with a references edge to the target bean name', () => {
     const xml = '<beans><bean id="fooService" class="com.example.Foo"/><alias name="fooService" alias="foo"/></beans>';

@@ -24,10 +24,12 @@ import { generateNodeId } from './tree-sitter-helpers';
  * namespace `-ref` attributes, and lookup-method/replaced-method injection.
  * Deliberately EXCLUDED from v1 (not "full" per the spec's mapping): SpEL
  * `#{bean}` refs; ref-harvesting the contents of other NamespacedElements
- * (aop/tx/task/jee beyond the id registration itself); and the spec's three
- * blind-spot promotions — ⑴ `*BeanName`-suffixed by-name refs, ⑵
- * mapperLocations/configLocation file-edge promotion (the future
- * Spring↔MyBatis bridge), ⑶ jobClass/targetClass by-value FQNs.
+ * (aop/tx/task/jee beyond the id registration itself); and two of the
+ * spec's three blind-spot promotions — ⑴ `*BeanName`-suffixed by-name refs,
+ * ⑵ mapperLocations/configLocation file-edge promotion (the future
+ * Spring↔MyBatis bridge). Blind spot ⑶ (jobClass/targetClass by-value FQN
+ * promotion) IS implemented as of v1.1 — see `isClassLikePropertyName` /
+ * `pushClassPromotion` below.
  */
 
 // ---------------------------------------------------------------------------
@@ -207,6 +209,49 @@ function javaFqnToQualifiedName(fqn: string): string {
   // above) — map every `$` the same way so `com.example.Outer$Inner`
   // resolves to `com.example::Outer::Inner`.
   return base.replace(/\$/g, '::');
+}
+
+/**
+ * Blind-spot ⑶ from the beans-xml spec: a `<property>`/`<constructor-arg>`
+ * (or p:/c: namespace literal) whose NAME conventionally holds a
+ * fully-qualified Java class name as its VALUE — `jobClass`, `targetClass`,
+ * `driverClassName`, … the classic Quartz/JDBC-by-string-configuration
+ * shape that otherwise leaves the owning bean with zero Java linkage. The
+ * boundary is the camelCase transition into the suffix, not a plain
+ * case-insensitive "ends with class": `superclass` (lowercase throughout)
+ * must NOT match — Java identifiers are case-sensitive and nobody writes a
+ * property meaning "this value is a class name" without capitalizing the
+ * `C`. Concretely: the char immediately before the suffix's `C` must be
+ * lowercase or a digit (a real camelCase boundary), so a bare `"Class"`/
+ * `"ClassName"` property name (no prefix to be a boundary against) does
+ * NOT match either — same as the literal `class=` attribute, which
+ * `emitBean`/`emitNamespacedBean` already handle via their own dedicated
+ * channel, not this one.
+ */
+function isClassLikePropertyName(name: string): boolean {
+  let prefixLen: number;
+  if (name.endsWith('ClassName')) prefixLen = name.length - 'ClassName'.length;
+  else if (name.endsWith('Class')) prefixLen = name.length - 'Class'.length;
+  else return false;
+  if (prefixLen <= 0) return false;
+  return /[a-z0-9]/.test(name[prefixLen - 1]!);
+}
+
+/**
+ * Is this value shaped like a Java FQN (`com.example.job.SyncJob`, or
+ * `com.example.Outer$Inner` for a static nested class)? At least two
+ * dotted segments, every segment a valid Java identifier (letters/digits/
+ * `_`/`$`, not starting with a digit) — which incidentally also rejects
+ * `${placeholder}` values (Spring property-placeholder syntax: the `{`
+ * right after `$` is not a legal identifier character, so the whole value
+ * fails to match) and anything containing whitespace, without needing a
+ * separate check for either. A single-segment value (no dot — e.g. a bare
+ * simple class name, or an ordinary non-FQN string) is deliberately
+ * excluded: promoting on a wrong-shaped value would fabricate a
+ * java-linkage edge nothing in the XML actually asserts.
+ */
+function isFqnShapedValue(value: string): boolean {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/.test(value);
 }
 
 /**
@@ -476,7 +521,14 @@ export class SpringBeansExtractor {
       }
 
       if (localTag === 'property' || localTag === 'constructor-arg') {
-        if (ownerNodeId) this.pushRef(ownerNodeId, child.attrs.ref, this.getLineNumber(child.start));
+        if (ownerNodeId) {
+          const line = this.getLineNumber(child.start);
+          this.pushRef(ownerNodeId, child.attrs.ref, line);
+          // By-value class promotion (blind spot ⑶): name="jobClass"
+          // value="com.example.job.SyncJob" (attribute form) or a <value>
+          // child (element form) — see `isClassLikePropertyName`.
+          this.pushClassPromotion(ownerNodeId, child.attrs.name, this.getPropertyValue(child), line);
+        }
         // The inline value can be a nested <bean>, <ref>, <list>, <map>, …
         this.walk(child, ownerNodeId, containerNodeId);
         continue;
@@ -680,12 +732,105 @@ export class SpringBeansExtractor {
     for (const attrName of Object.keys(el.attrs)) {
       if (this.isNsRefAttr(attrName, this.pPrefix) || this.isNsRefAttr(attrName, this.cPrefix)) {
         this.pushRef(fromNodeId, el.attrs[attrName], line);
+        continue;
       }
+      // By-value class promotion (blind spot ⑶), p:/c: namespace LITERAL
+      // form: `p:jobClass="com.example.job.SyncJob"` — same property-name
+      // convention as the `<property name="jobClass" value="…">` form
+      // above, just spelled as a namespace attribute instead of a child
+      // element. Deliberately checked only for attrs that AREN'T already a
+      // `-ref` attr (handled above) — a `-ref` attribute's value is a bean
+      // name, never a class FQN.
+      const literalName = this.nsLiteralPropertyName(attrName);
+      if (literalName) this.pushClassPromotion(fromNodeId, literalName, el.attrs[attrName], line);
     }
   }
 
   private isNsRefAttr(attrName: string, prefix: string): boolean {
     return attrName.startsWith(`${prefix}:`) && attrName.endsWith('-ref');
+  }
+
+  /** `p:jobClass="…"` → `"jobClass"`; not a p:/c: namespace attr → `undefined`. */
+  private nsLiteralPropertyName(attrName: string): string | undefined {
+    for (const prefix of [this.pPrefix, this.cPrefix]) {
+      if (attrName.startsWith(`${prefix}:`)) return attrName.slice(prefix.length + 1);
+    }
+    return undefined;
+  }
+
+  /**
+   * The by-value form of a `<property>`/`<constructor-arg>`: either the
+   * `value=` attribute, or (when that's absent) the text of a `<value>`
+   * child element (`<property name="jobClass"><value>com.example.job
+   * .SyncJob</value></property>` — equally common in older/verbose Spring
+   * XML). `value=` wins when both are somehow present (shouldn't happen in
+   * well-formed XML, but attribute form is the cheaper/more direct read).
+   */
+  private getPropertyValue(el: XmlEl): string | undefined {
+    if (el.attrs.value !== undefined) return el.attrs.value;
+    const valueChild = el.children.find((c) => localName(c.tag) === 'value');
+    return valueChild ? this.getElementText(valueChild) : undefined;
+  }
+
+  /**
+   * Inner text of an element with no element children of its own — e.g.
+   * `<value>com.example.job.SyncJob</value>`. The lenient tree parser never
+   * records text nodes (only tag/attrs/children — see `XmlEl`, and the
+   * class doc's rationale for why: nothing else here needs element text),
+   * so this re-derives it directly from `this.source` by locating the end
+   * of the opening tag and the start of the matching close tag. A
+   * self-closing element (`<value/>`) has no text by construction. A mixed-
+   * content element (unexpected for `<value>`, but handled defensively)
+   * yields only the text before its first child.
+   *
+   * The close-tag search is for THIS element's own literal `</tag` token
+   * (not a bare `</`), searched from `el.end - 1`: adjacent same-offset
+   * closing tags (`<value>x</value></property>`, the common no-whitespace
+   * case) put the very next sibling's `</property` starting AT `el.end`
+   * (`</value>`'s own close ends exactly where `</property>`'s begins) — a
+   * bare `</` search anchored at `el.end` matches that sibling's closer
+   * instead of this element's own, corrupting the text with a trailing
+   * `</value>` tail. Anchoring the tag-specific search one position earlier
+   * and requiring an exact tag-name match rules that out.
+   */
+  private getElementText(el: XmlEl): string {
+    const src = this.source;
+    const openTagEnd = src.indexOf('>', el.start);
+    if (openTagEnd < 0 || src[openTagEnd - 1] === '/') return '';
+    let textEnd: number;
+    if (el.children.length > 0) {
+      textEnd = el.children[0]!.start;
+    } else {
+      const closeStart = src.lastIndexOf(`</${el.tag}`, el.end - 1);
+      textEnd = closeStart > openTagEnd ? closeStart : el.end;
+    }
+    return decodeXmlEntities(src.slice(openTagEnd + 1, textEnd)).trim();
+  }
+
+  /**
+   * Emit the blind-spot-⑶ `instantiates` reference when `propName` is
+   * class-shaped (`isClassLikePropertyName`) and `rawValue` is FQN-shaped
+   * (`isFqnShapedValue`) — shared by all three surface forms (property/
+   * constructor-arg `value=`, `<value>` child text, p:/c: namespace
+   * literal). Reuses `javaFqnToQualifiedName` so this resolves through the
+   * exact same channel as the headline `class=` promotion.
+   */
+  private pushClassPromotion(
+    fromNodeId: string | null,
+    propName: string | undefined,
+    rawValue: string | undefined,
+    line: number
+  ): void {
+    if (!fromNodeId || !propName || !isClassLikePropertyName(propName.trim())) return;
+    const value = rawValue?.trim();
+    if (!value || !isFqnShapedValue(value)) return;
+    this.unresolvedReferences.push({
+      fromNodeId,
+      referenceName: javaFqnToQualifiedName(value),
+      referenceKind: 'instantiates',
+      line,
+      column: 0,
+    });
   }
 
   private emitImport(el: XmlEl): void {
