@@ -298,10 +298,27 @@ const PLACEHOLDER_REF_DEFAULT_RE = /^\$\{[^}:]*:([A-Za-z_][A-Za-z0-9_.]*)\}$/;
  * (unlike the `:default` form above), so `pushRef` drops it: no
  * `references` edge is emitted, same "don't fabricate a maybe-wrong edge"
  * stance `isFqnShapedValue` already takes for the by-value class-promotion
- * channel's own `${…}` values. Matched broadly (any content, no colon
- * requirement) so it also catches a malformed/unsupported default shape
- * (`${prop:123bad}`, `${prop:a-b}`) that fails the stricter DEFAULT regex
- * above — those have no statically-resolvable name either.
+ * channel's own `${…}` values. Matched broadly (any content but `}`, no
+ * colon requirement) so it also catches a default shape the stricter
+ * DEFAULT regex above rejects — e.g. `${prop:123bad}` (default starts with
+ * a digit) and, notably, `${prop:a-b}` (default contains a hyphen). The
+ * latter is NOT malformed XML — hyphens are legal in Spring bean ids/names
+ * — it is simply a shape this extractor deliberately doesn't resolve: the
+ * DEFAULT regex's capture class excludes `-` on purpose (kept narrow to
+ * avoid over-matching), so a real, legal hyphenated bean-name default is
+ * silently dropped here rather than resolved. Accepted recall loss, not a
+ * correctness bug — see the pinning test for this exact drop.
+ *
+ * Because the character class is `[^}]*`, it stops at the FIRST `}` in the
+ * string. A nested placeholder default — `${p:${q}}` — has its inner `}`
+ * land before the outer one, so `[^}]*` can only match up through that
+ * inner `}`, leaving the string not fully consumed and failing this
+ * regex's trailing `$` anchor too. Nested placeholders therefore match
+ * NEITHER regex here and fall all the way through to the ordinary
+ * literal-string path (the same "unmatched" branch mixed text like
+ * `prefix${env.prop:default}` takes) rather than being dropped — a
+ * dangling reference to the raw `${p:${q}}` string, not an evaluated one.
+ * See the pinning test for this case too.
  */
 const PLACEHOLDER_REF_NO_DEFAULT_RE = /^\$\{[^}]*\}$/;
 

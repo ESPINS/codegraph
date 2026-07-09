@@ -383,11 +383,18 @@ describe('Spring beans extractor — PLACEHOLDER-REF DEFAULT (v1.1: ref="${env.p
     expect(names).not.toContain('defaultBean');
   });
 
-  it('does NOT apply DEFAULT-extraction to class= (bean-ref channels only, never the by-value class attribute)', () => {
+  it('does NOT apply DEFAULT-extraction to class= (bean-ref channels only, never the by-value class attribute) — pins the mangled placeholder emitted instead', () => {
     const xml = '<beans><bean id="a" class="${env.prop:com.example.DefaultClass}"/></beans>';
     const a = beanByName(xml, 'a')!;
     const instantiates = refs(xml).filter((x) => x.fromNodeId === a.id && x.referenceKind === 'instantiates');
     expect(instantiates.some((x) => x.referenceName === 'com.example::DefaultClass')).toBe(false);
+    // class= is never routed through pushRef's placeholder handling — it goes
+    // straight to javaFqnToQualifiedName, which blindly rewrites the LAST
+    // `.`->`::` and every `$`->`::` with no placeholder-awareness. Pin what
+    // that actually produces so a future change to either function is forced
+    // to notice this dangling, mangled reference rather than leaving it as
+    // invisible garbage a passing test doesn't surface.
+    expect(instantiates.map((x) => x.referenceName)).toContain('::{env.prop:com.example::DefaultClass}');
   });
 
   it('also resolves the default through the p:*-ref namespace channel (same shared pushRef path)', () => {
@@ -396,6 +403,44 @@ describe('Spring beans extractor — PLACEHOLDER-REF DEFAULT (v1.1: ref="${env.p
     const a = beanByName(xml, 'a')!;
     const names = refsFrom(xml, a.id).map((r) => r.referenceName);
     expect(names).toContain('defaultSvc');
+  });
+
+  it('also resolves the default through the depends-on= attribute channel (same shared pushRef path)', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A" depends-on="${env.dep:defaultDep}"/></beans>';
+    const a = beanByName(xml, 'a')!;
+    const names = refsFrom(xml, a.id).map((r) => r.referenceName);
+    expect(names).toContain('defaultDep');
+  });
+
+  it('does NOT resolve a default when the placeholder is only a SUFFIX of the value (${env.prop:default}Suffix) — falls through as the raw literal, unmatched', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A">' +
+      '<property name="dep" ref="${env.prop:defaultBean}Suffix"/>' +
+      '</bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    const names = refsFrom(xml, a.id).map((r) => r.referenceName);
+    expect(names).toContain('${env.prop:defaultBean}Suffix');
+    expect(names).not.toContain('defaultBean');
+  });
+
+  it('drops a placeholder default containing a hyphen (${prop:a-b}) — a legal hyphenated Spring bean name that the DEFAULT regex deliberately does not capture', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A">' +
+      '<property name="dep" ref="${env.prop:my-bean}"/>' +
+      '</bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    expect(refsFrom(xml, a.id)).toHaveLength(0);
+  });
+
+  it('a nested placeholder default (${p:${q}}) matches neither placeholder regex and falls through as the raw literal, unmatched', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A">' +
+      '<property name="dep" ref="${env.prop:${env.fallback}}"/>' +
+      '</bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    const names = refsFrom(xml, a.id).map((r) => r.referenceName);
+    expect(names).toContain('${env.prop:${env.fallback}}');
   });
 });
 
