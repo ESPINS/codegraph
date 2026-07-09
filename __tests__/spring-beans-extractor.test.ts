@@ -894,3 +894,115 @@ describe('Spring beans extractor — cross-file bean→bean reference resolves v
     expect(referenceEdge).toBeDefined();
   });
 });
+
+describe('Spring beans extractor — ANNOTATION-SCANNED BEAN JOIN (v1.1 V3-scanJoin)', () => {
+  let tempDir: string;
+  let cg: CodeGraph | undefined;
+
+  afterEach(() => {
+    if (cg) {
+      cg.destroy();
+      cg = undefined;
+    } else if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true });
+    }
+  });
+
+  it('resolves ref="userService" (no matching XML bean) to the Java class annotated @Service, via the decapitalized default bean name', async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-spring-beans-scanjoin-default-'));
+    const srcDir = path.join(tempDir, 'src', 'main', 'java', 'com', 'example');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(srcDir, 'UserService.java'),
+      'package com.example;\n\n' +
+        'import org.springframework.stereotype.Service;\n\n' +
+        '@Service\npublic class UserService {\n    public UserService() {}\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'applicationContext.xml'),
+      '<beans><bean id="controller" class="com.example.UserController">' +
+        '<property name="userService" ref="userService"/></bean></beans>\n'
+    );
+
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+
+    const controller = cg.getNodesByKind('variable').find((n) => n.name === 'controller');
+    const userService = cg.getNodesByKind('class').find((n) => n.name === 'UserService');
+    expect(controller).toBeDefined();
+    expect(userService).toBeDefined();
+
+    const outgoing = cg.getOutgoingEdges(controller!.id);
+    const referenceEdge = outgoing.find((e) => e.kind === 'references' && e.target === userService!.id);
+    expect(referenceEdge).toBeDefined();
+    expect(referenceEdge!.metadata?.resolvedBy).toBe('framework');
+  });
+
+  it('resolves ref="customName" to the class carrying the matching explicit @Service("customName") value', async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-spring-beans-scanjoin-explicit-'));
+    const srcDir = path.join(tempDir, 'src', 'main', 'java', 'com', 'example');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(srcDir, 'UserService.java'),
+      'package com.example;\n\n' +
+        'import org.springframework.stereotype.Service;\n\n' +
+        '@Service("customName")\npublic class UserService {\n    public UserService() {}\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'applicationContext.xml'),
+      '<beans><bean id="controller" class="com.example.UserController">' +
+        '<property name="userService" ref="customName"/></bean></beans>\n'
+    );
+
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+
+    const controller = cg.getNodesByKind('variable').find((n) => n.name === 'controller');
+    const userService = cg.getNodesByKind('class').find((n) => n.name === 'UserService');
+    expect(controller).toBeDefined();
+    expect(userService).toBeDefined();
+
+    const outgoing = cg.getOutgoingEdges(controller!.id);
+    const referenceEdge = outgoing.find((e) => e.kind === 'references' && e.target === userService!.id);
+    expect(referenceEdge).toBeDefined();
+  });
+
+  it('does NOT resolve when two classes derive the same default bean name (ambiguity negative — no edge)', async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-spring-beans-scanjoin-ambiguous-'));
+    const srcDirA = path.join(tempDir, 'src', 'main', 'java', 'com', 'example', 'a');
+    const srcDirB = path.join(tempDir, 'src', 'main', 'java', 'com', 'example', 'b');
+    fs.mkdirSync(srcDirA, { recursive: true });
+    fs.mkdirSync(srcDirB, { recursive: true });
+    fs.writeFileSync(
+      path.join(srcDirA, 'UserService.java'),
+      'package com.example.a;\n\n' +
+        'import org.springframework.stereotype.Service;\n\n' +
+        '@Service\npublic class UserService {\n    public UserService() {}\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(srcDirB, 'UserService.java'),
+      'package com.example.b;\n\n' +
+        'import org.springframework.stereotype.Service;\n\n' +
+        '@Service\npublic class UserService {\n    public UserService() {}\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'applicationContext.xml'),
+      '<beans><bean id="controller" class="com.example.a.UserController">' +
+        '<property name="userService" ref="userService"/></bean></beans>\n'
+    );
+
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+
+    const controller = cg.getNodesByKind('variable').find((n) => n.name === 'controller');
+    expect(controller).toBeDefined();
+    const userServiceClasses = cg.getNodesByKind('class').filter((n) => n.name === 'UserService');
+    expect(userServiceClasses.length).toBe(2);
+
+    const outgoing = cg.getOutgoingEdges(controller!.id);
+    const referenceEdge = outgoing.find(
+      (e) => e.kind === 'references' && userServiceClasses.some((c) => c.id === e.target)
+    );
+    expect(referenceEdge).toBeUndefined();
+  });
+});

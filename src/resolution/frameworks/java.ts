@@ -8,6 +8,177 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 
+// ---------------------------------------------------------------------------
+// ANNOTATION-SCANNED BEAN JOIN (v1.1 V3-scanJoin)
+// ---------------------------------------------------------------------------
+// The resolution-side bridge for `SpringBeansExtractor`'s bean→bean `ref=`
+// channel: `ref="userService"` names no `<bean id="userService">` anywhere in
+// the XML, but in real Spring apps it overwhelmingly names a Java class
+// stereotype-annotated `@Service`/`@Component`/`@Repository`/`@Controller`,
+// whose EFFECTIVE bean name is either the annotation's explicit value
+// (`@Service("userService")`) or, absent one, the decapitalized simple class
+// name (`UserService` → `userService`, Spring's own default-naming rule).
+// Real-world validation found ~52% of dangling Spring-beans-XML refs were
+// exactly this.
+//
+// Design choice — resolution-time regex scan over class source, NOT a
+// `decorates`-edge lookup: `extractDecoratorsFor` (tree-sitter.ts) already
+// emits a `decorates` UnresolvedReference from an annotated class to the
+// annotation's bare name (`Service`), which looks like the obvious signal to
+// query post-resolution. It isn't usable here: Spring's own `@Service` et al.
+// are framework-external (never declared in-repo), so that `decorates` ref
+// itself never resolves to anything — like every other unresolved reference,
+// it gets DELETED from the unresolved_references table at the end of the
+// very same batch that failed to resolve it (see `resolveAndPersistBatched`'s
+// "both resolved and unresolved refs are deleted" cleanup), with no ordering
+// guarantee relative to when THIS bridge's own ref is processed. Nor does it
+// carry the annotation's explicit VALUE argument — `extractDecoratorsFor`
+// only records the decorator's plain identifier. A direct regex scan of the
+// class's own source (mirroring this file's existing `@Value`/`@RequestMapping`
+// extraction, and `springResolver.detect()`'s own `context.readFile` use) is
+// therefore both more accurate (captures the value) and unconditionally
+// available, matching the task brief's fallback: "have the JAVA extractor
+// already record the derived bean name somewhere match-able" — done here at
+// resolve time instead of extraction time so it stays a pure resolution-layer
+// concern, costs nothing for non-Spring-XML projects (built lazily, only when
+// an XML bean ref actually needs it), and needs no new node kind.
+//
+// Precision gates (per codegraph's retrieval/precision contract):
+//  - Scoped to unresolved `references` whose SOURCE is a Spring-beans-XML
+//    bean node (`kind: 'variable'`, `language: 'xml'` — SpringBeansExtractor's
+//    node shape; see its class doc) — never touches a same-shaped `references`
+//    ref from any other language/extractor.
+//  - Resolves ONLY when EXACTLY ONE class in the whole project derives that
+//    effective bean name (`buildSpringBeanNameIndex` below) — two classes
+//    landing on the same name (default OR explicit) is genuine ambiguity in a
+//    real Spring app (whichever XML config wins depends on classpath scanning
+//    order, which codegraph can't observe), so it's left unresolved rather
+//    than guessing.
+//  - Marked like every other framework-synthesized edge here: `resolvedBy:
+//    'framework'` via the normal ResolvedRef→Edge path (`createEdges` in
+//    resolution/index.ts stamps `metadata.{confidence,resolvedBy}` — the same
+//    convention `resolveByNameAndKind`'s Service/Repository/Controller
+//    patterns below already use), no bespoke edge-creation path needed.
+
+/** Java/Kotlin stereotype annotations that register a bean with Spring's component scanner. */
+const SPRING_STEREOTYPE_ANNOTATIONS = ['Component', 'Service', 'Repository', 'Controller'];
+
+/**
+ * Reused across all four stereotypes: `@Stereotype` optionally followed by
+ * `("value")` / `(value = "value")`, then zero or more OTHER annotations
+ * (any order relative to the stereotype — `@Service @Transactional class X`
+ * and `@Transactional @Service class X` both match, since the regex only
+ * anchors on the stereotype token and the literal class name, not their
+ * relative position) and modifier keywords, then `class <ClassName>`. Built
+ * per-class (the class's own simple name is spliced in as a literal) rather
+ * than once, so a multi-class file resolves each class's OWN annotation only
+ * — never a sibling class's.
+ */
+function stereotypeAnnotationRegex(className: string): RegExp {
+  const escapedClass = className.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const stereotypeAlt = SPRING_STEREOTYPE_ANNOTATIONS.join('|');
+  return new RegExp(
+    `@(?:${stereotypeAlt})\\b` +
+      `(?:\\s*\\(\\s*(?:value\\s*=\\s*)?["']([^"']*)["']\\s*\\))?` +
+      `\\s*(?:@[\\w.]+(?:\\([^)]*\\))?\\s*)*` +
+      `(?:public\\s+|final\\s+|abstract\\s+|static\\s+|sealed\\s+|non-sealed\\s+|open\\s+|data\\s+)*` +
+      `class\\s+${escapedClass}\\b`
+  );
+}
+
+/** `UserService` → `userService` — Spring's own default bean-naming rule. */
+function decapitalize(name: string): string {
+  return name.length > 0 ? name.charAt(0).toLowerCase() + name.slice(1) : name;
+}
+
+/**
+ * This class's EFFECTIVE Spring bean name, or `null` when it carries no
+ * stereotype annotation at all. `context.readFile` + `stripCommentsForRegex`
+ * mirrors `springResolver.extract()`'s own regex approach elsewhere in this
+ * file (comments stripped so a `// @Service` in a docstring never fires;
+ * string-literal CONTENTS are preserved by `stripCommentsForRegex`'s C-style
+ * mode, so the `"userService"` in `@Service("userService")` survives intact).
+ */
+function derivedBeanName(cls: Node, context: ResolutionContext): string | null {
+  const content = context.readFile(cls.filePath);
+  if (!content) return null;
+  // Kotlin shares Java's comment/string syntax; `stripCommentsForRegex` has
+  // no dedicated 'kotlin' mode, and `extract()` below already reuses 'java'
+  // for both languages for the same reason.
+  const safe = stripCommentsForRegex(content, 'java');
+  const match = stereotypeAnnotationRegex(cls.name).exec(safe);
+  if (!match) return null;
+  const explicitValue = match[1]?.trim();
+  return explicitValue ? explicitValue : decapitalize(cls.name);
+}
+
+/**
+ * derived bean name → candidate class node ids, built ONCE per resolution
+ * context (a `WeakMap` keyed by the context object itself — not a module-
+ * level `Map` — so a second `CodeGraph` instance in the same process, e.g.
+ * back-to-back test suites, never sees a stale/foreign project's index; same
+ * pattern as `cics.ts`'s `transidIndexes` and `rust.ts`'s
+ * `cargoWorkspaceMapCache`). Lazily built on first use — a project with no
+ * Spring-beans-XML dangling refs never triggers a single `readFile` here.
+ * Cost is one file read + one regex exec per Java/Kotlin CLASS node,
+ * proportional to project size but paid at most once per resolution pass —
+ * never per-reference, which is what would risk the O(refs × classes)
+ * blow-up the config-key resolution incident (#1180) already burned this
+ * codebase on once.
+ */
+const springBeanNameIndexes = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+function buildSpringBeanNameIndex(context: ResolutionContext): Map<string, string[]> {
+  const index = new Map<string, string[]>();
+  const classes = context
+    .getNodesByKind('class')
+    .filter((n) => n.language === 'java' || n.language === 'kotlin');
+  for (const cls of classes) {
+    const name = derivedBeanName(cls, context);
+    if (!name) continue;
+    const existing = index.get(name);
+    if (existing) existing.push(cls.id);
+    else index.set(name, [cls.id]);
+  }
+  return index;
+}
+
+/**
+ * A bare identifier shaped like a decapitalized multi-word class name
+ * (`userService`, `dataSourceBean`) — starts lowercase, has at least one
+ * LATER uppercase letter (a genuine camelCase word boundary), and no
+ * separator character. This is the `claimsReference` opt-in for the join
+ * above: the ref's exact name never exists as a declared node (that's WHY
+ * it's dangling — the whole point of this bridge), so the resolver's
+ * name-existence pre-filter drops it before `resolve()` ever runs, same
+ * problem `cics.ts`'s `cics-transid:` prefix and `terraform.ts`'s
+ * `module.M:` prefix solve for their own dangling-by-construction refs. This
+ * bridge has no such extractor-emitted sentinel to key off (the XML
+ * extractor's `ref=` value is deliberately a PLAIN bean name — see
+ * `pushRef`'s doc comment — so ordinary bean→bean XML refs keep resolving via
+ * the generic exact-name matcher unchanged), so the opt-in is a name-SHAPE
+ * heuristic instead. Deliberately narrower than a bare `/^[a-z]\w*$/` shape
+ * (which would additionally claim single-word names like `list`/`service` —
+ * the common shape of a genuinely-dangling call/typo in ANY language, not
+ * just Spring — inflating this escape hatch project-wide): requiring an
+ * internal capital cuts that overlap sharply, since a real single-word
+ * identifier essentially never LOOKS like this, while a decapitalized
+ * multi-word Java class name (the realistic bean-name population validation
+ * found) always does. `resolve()` below still gates the actual work (index
+ * build + lookup) to confirmed XML-bean-sourced refs, so even a stray
+ * non-Spring camelCase name that slips through this shape check costs one
+ * extra O(1) field check in every OTHER registered resolver's `resolve()` —
+ * negligible, and the same class of cost `drupal.ts`/`laravel.ts` already
+ * accept for their own broader shape-based `claimsReference` heuristics.
+ * Trade-off, accepted deliberately: an explicit `@Service("all-lowercase")`
+ * or `@Service("kebab-case")` value has no internal capital and won't be
+ * claimed by this shape check — recall loss on an unusual naming choice, not
+ * a correctness bug (mirrors this codebase's existing "accepted recall loss"
+ * stance — see `PLACEHOLDER_REF_NO_DEFAULT_RE`'s doc comment in the
+ * extractor for the same kind of documented trade-off).
+ */
+const XML_BEAN_JOIN_NAME_SHAPE_RE = /^[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*$/;
+
 export const springResolver: FrameworkResolver = {
   name: 'spring',
   languages: ['java', 'kotlin', 'yaml', 'properties'],
@@ -17,7 +188,9 @@ export const springResolver: FrameworkResolver = {
     // name carries the `:prefix` sentinel — there's no declared symbol with
     // that exact spelling, so the resolver's name-existence pre-filter would
     // drop it. Opt those through.
-    return name.endsWith(':prefix');
+    if (name.endsWith(':prefix')) return true;
+    // See `XML_BEAN_JOIN_NAME_SHAPE_RE`'s doc comment above.
+    return XML_BEAN_JOIN_NAME_SHAPE_RE.test(name);
   },
 
   detect(context: ResolutionContext): boolean {
@@ -58,6 +231,41 @@ export const springResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // ANNOTATION-SCANNED BEAN JOIN (v1.1 V3-scanJoin) — see the module-level
+    // doc comment above for the full design rationale. Gated first (cheap
+    // field checks) so every OTHER ref pays only this one `&&` chain: a
+    // Spring-beans-XML bean node's `ref=` channel is the ONLY thing that
+    // reaches here (`kind: 'variable'`, `language: 'xml'` per
+    // SpringBeansExtractor.emitBean/emitNamespacedBean), so a `references`
+    // ref from any other xml-language source (MyBatis's extractor also
+    // emits `xml`-language refs) is excluded by the node-kind check below,
+    // not just the language check.
+    if (ref.referenceKind === 'references' && ref.language === 'xml') {
+      const fromNode = context.getNodeById?.(ref.fromNodeId);
+      // `getNodeById` is optional on `ResolutionContext` (test doubles may
+      // omit it); when unavailable, fall back to trusting `language==='xml'`
+      // + `referenceKind==='references'` alone — no other xml-language
+      // reference channel plausibly produces a name shaped like a
+      // stereotype-derived bean name AND landing on a real, unique match.
+      if (!fromNode || (fromNode.kind === 'variable' && fromNode.language === 'xml')) {
+        let index = springBeanNameIndexes.get(context);
+        if (!index) {
+          index = buildSpringBeanNameIndex(context);
+          springBeanNameIndexes.set(context, index);
+        }
+        const candidates = index.get(ref.referenceName);
+        if (candidates && candidates.length === 1) {
+          return { original: ref, targetNodeId: candidates[0]!, confidence: 0.85, resolvedBy: 'framework' };
+        }
+        // 0 candidates (no annotated class derives this name) or >1
+        // (genuine ambiguity — the precision gate) — no edge, and no other
+        // pattern in this resolver applies to an XML-sourced ref either, so
+        // stop here rather than falling through to the Java/Kotlin-source
+        // patterns below.
+        return null;
+      }
+    }
+
     // Spring config-key references — `@Value("${key}")` (single leaf) and
     // `@ConfigurationProperties(prefix="X")` (entire subtree, marked with the
     // `:prefix` suffix in extractSpringValueBindings). Lookup goes through
