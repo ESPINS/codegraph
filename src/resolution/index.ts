@@ -771,7 +771,7 @@ export class ReferenceResolver {
       !isNixPathImportRef(ref) &&
       !this.hasAnyPossibleMatch(existenceName) &&
       !this.matchesAnyImport(ref) &&
-      !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName))
+      !this.frameworks.some((f) => f.claimsReference?.(ref.referenceName, ref, this.context))
     ) {
       return null;
     }

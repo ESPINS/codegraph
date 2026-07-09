@@ -1005,4 +1005,171 @@ describe('Spring beans extractor — ANNOTATION-SCANNED BEAN JOIN (v1.1 V3-scanJ
     );
     expect(referenceEdge).toBeUndefined();
   });
+
+  it('prefers an XML-declared <bean id="userService"> over the same-named @Service class (join stands down)', async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-spring-beans-scanjoin-xmlwins-'));
+    const srcDir = path.join(tempDir, 'src', 'main', 'java', 'com', 'example');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(srcDir, 'UserService.java'),
+      'package com.example;\n\n' +
+        'import org.springframework.stereotype.Service;\n\n' +
+        '@Service\npublic class UserService {\n    public UserService() {}\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'applicationContext.xml'),
+      '<beans>' +
+        '<bean id="userService" class="com.example.UserServiceImpl"/>' +
+        '<bean id="controller" class="com.example.UserController">' +
+        '<property name="userService" ref="userService"/></bean></beans>\n'
+    );
+
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+
+    const controller = cg.getNodesByKind('variable').find((n) => n.name === 'controller');
+    const declaredBean = cg.getNodesByKind('variable').find((n) => n.name === 'userService');
+    const annotatedClass = cg.getNodesByKind('class').find((n) => n.name === 'UserService');
+    expect(controller).toBeDefined();
+    expect(declaredBean).toBeDefined();
+    expect(annotatedClass).toBeDefined();
+
+    const outgoing = cg.getOutgoingEdges(controller!.id);
+    const toDeclaredBean = outgoing.find((e) => e.kind === 'references' && e.target === declaredBean!.id);
+    const toAnnotatedClass = outgoing.find((e) => e.kind === 'references' && e.target === annotatedClass!.id);
+    // The explicit XML bean definition wins — Spring semantics say an
+    // explicit `<bean id>` overrides a scanned component with the same name.
+    expect(toDeclaredBean).toBeDefined();
+    expect(toAnnotatedClass).toBeUndefined();
+  });
+
+  it('prefers a profile-split XML-declared bean (2 files declaring id="userService") over the @Service class', async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-spring-beans-scanjoin-profilesplit-'));
+    const srcDir = path.join(tempDir, 'src', 'main', 'java', 'com', 'example');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(srcDir, 'UserService.java'),
+      'package com.example;\n\n' +
+        'import org.springframework.stereotype.Service;\n\n' +
+        '@Service\npublic class UserService {\n    public UserService() {}\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'app-dev.xml'),
+      '<beans><bean id="userService" class="com.example.DevUserServiceImpl"/></beans>\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'app-prod.xml'),
+      '<beans><bean id="userService" class="com.example.ProdUserServiceImpl"/></beans>\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'applicationContext.xml'),
+      '<beans><bean id="controller" class="com.example.UserController">' +
+        '<property name="userService" ref="userService"/></bean></beans>\n'
+    );
+
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+
+    const controller = cg.getNodesByKind('variable').find((n) => n.name === 'controller');
+    const declaredBeans = cg.getNodesByKind('variable').filter((n) => n.name === 'userService');
+    const annotatedClass = cg.getNodesByKind('class').find((n) => n.name === 'UserService');
+    expect(controller).toBeDefined();
+    expect(declaredBeans.length).toBe(2);
+    expect(annotatedClass).toBeDefined();
+
+    const outgoing = cg.getOutgoingEdges(controller!.id);
+    const toAnnotatedClass = outgoing.find((e) => e.kind === 'references' && e.target === annotatedClass!.id);
+    // The join must stand down even when several XML files declare the same
+    // id — an explicit (if ambiguous) XML bean definition still outranks the
+    // scanned component guess.
+    expect(toAnnotatedClass).toBeUndefined();
+  });
+
+  it('does NOT let the XML-bean-join name-shape claim hijack an unrelated dangling camelCase call ref via fuzzy matching', async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-spring-beans-scanjoin-noleak-'));
+    const srcDir = path.join(tempDir, 'src', 'main', 'java', 'com', 'example');
+    fs.mkdirSync(srcDir, { recursive: true });
+    // Present so springResolver.detect() fires (project-level Spring detection).
+    fs.writeFileSync(
+      path.join(srcDir, 'UserService.java'),
+      'package com.example;\n\n' +
+        'import org.springframework.stereotype.Service;\n\n' +
+        '@Service\npublic class UserService {\n    public UserService() {}\n}\n'
+    );
+    // Calls an external, undeclared parseJSON() — dangling by construction,
+    // and shaped like a decapitalized multi-word name (camelCase with an
+    // internal capital) so it matches XML_BEAN_JOIN_NAME_SHAPE_RE.
+    fs.writeFileSync(
+      path.join(srcDir, 'Caller.java'),
+      'package com.example;\n\n' +
+        'public class Caller {\n' +
+        '    public void run() {\n' +
+        '        parseJSON();\n' +
+        '    }\n' +
+        '}\n'
+    );
+    // An unrelated same-shaped (case-insensitive near-miss) method that
+    // `matchFuzzy` could wrongly latch onto if the shape-only claim leaked
+    // this ref into the full resolution pipeline.
+    fs.writeFileSync(
+      path.join(srcDir, 'JsonUtil.java'),
+      'package com.example;\n\n' +
+        'public class JsonUtil {\n' +
+        '    public static void parseJson() {}\n' +
+        '}\n'
+    );
+
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+
+    const runMethod = cg.getNodesByKind('method').find((n) => n.name === 'run');
+    const parseJson = cg.getNodesByKind('method').find((n) => n.name === 'parseJson');
+    expect(runMethod).toBeDefined();
+    expect(parseJson).toBeDefined();
+
+    const outgoing = cg.getOutgoingEdges(runMethod!.id);
+    const wrongFuzzyEdge = outgoing.find((e) => e.kind === 'calls' && e.target === parseJson!.id);
+    expect(wrongFuzzyEdge).toBeUndefined();
+  });
+
+  it('does NOT apply the join to a genuinely-dangling MyBatis <include refid> ref, even when it name-shape-matches a @Service bean name', async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-spring-beans-scanjoin-mybatis-negative-'));
+    const srcDir = path.join(tempDir, 'src', 'main', 'java', 'com', 'example');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(srcDir, 'ParseUserJson.java'),
+      'package com.example;\n\n' +
+        'import org.springframework.stereotype.Service;\n\n' +
+        '@Service\npublic class ParseUserJson {\n    public ParseUserJson() {}\n}\n'
+    );
+    // A namespace-less iBatis 2 <sqlMap> mapper (namespace optional per the
+    // extractor's own routing) so the <include refid> resolves to a bare,
+    // unqualified name — landing squarely on XML_BEAN_JOIN_NAME_SHAPE_RE's
+    // shape ("parseUserJson", decapitalized-multi-word) while its SOURCE
+    // node is a MyBatis statement (`kind: 'method'`), not a Spring bean
+    // (`kind: 'variable'`) — the exact channel `isXmlBeanJoinSourceRef` must
+    // reject. No `<sql id="parseUserJson">` fragment exists in this mapper —
+    // the refid is genuinely dangling (no legitimate same-name candidate),
+    // so this isolates whether the framework join (or a fuzzy hijack let
+    // through by its `claimsReference` pre-filter escape) wrongly resolves
+    // it, rather than a legitimate exact/qualified-name match masking it.
+    fs.writeFileSync(
+      path.join(tempDir, 'UserMapper.xml'),
+      '<sqlMap>' +
+        '<select id="getUser"><include refid="parseUserJson"/>SELECT * FROM users</select>' +
+        '</sqlMap>\n'
+    );
+
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+
+    const getUser = cg.getNodesByKind('method').find((n) => n.name === 'getUser');
+    const annotatedClass = cg.getNodesByKind('class').find((n) => n.name === 'ParseUserJson');
+    expect(getUser).toBeDefined();
+    expect(annotatedClass).toBeDefined();
+
+    const outgoing = cg.getOutgoingEdges(getUser!.id);
+    const wrongEdge = outgoing.find((e) => e.target === annotatedClass!.id);
+    expect(wrongEdge).toBeUndefined();
+  });
 });

@@ -196,8 +196,20 @@ export interface FrameworkResolver {
    * an attribute/descriptor, not a declared symbol (e.g. Django's
    * `self._iterable_class(...)`, React effect callbacks). Returning true lets the
    * ref reach `resolve()` instead of being dropped for having no name match.
+   *
+   * IMPORTANT — this pre-filter escape routes the ref through the resolver's
+   * ENTIRE pipeline (every OTHER registered framework, import resolution, and
+   * Strategy-3 name matching incl. `matchFuzzy`), not just this resolver's own
+   * `resolve()`. A NAME-only shape check (e.g. "looks like a camelCase word")
+   * has no way to see `referenceKind`/`language`/source-node kind, so it can't
+   * be scoped to only the refs this resolver can actually own — it opts EVERY
+   * ref of that shape, project-wide, across every language, into the full
+   * pipeline, including into strategies that then resolve it wrongly. The
+   * optional `ref`/`context` parameters let an implementation gate on
+   * `referenceKind`/`language`/source-node kind too — use them whenever the
+   * name-shape heuristic isn't inherently unambiguous on the name alone.
    */
-  claimsReference?(name: string): boolean;
+  claimsReference?(name: string, ref?: UnresolvedRef, context?: ResolutionContext): boolean;
   /**
    * Extract framework-specific nodes and references from a file.
    *
