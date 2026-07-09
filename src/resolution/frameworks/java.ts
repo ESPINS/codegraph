@@ -75,8 +75,23 @@ import { stripCommentsForRegex } from '../strip-comments';
 //    convention `resolveByNameAndKind`'s Service/Repository/Controller
 //    patterns below already use), no bespoke edge-creation path needed.
 
-/** Java/Kotlin stereotype annotations that register a bean with Spring's component scanner. */
-const SPRING_STEREOTYPE_ANNOTATIONS = ['Component', 'Service', 'Repository', 'Controller'];
+/**
+ * Java/Kotlin stereotype annotations that register a bean with Spring's
+ * component scanner. `RestController`/`RestControllerAdvice` are their own
+ * distinct annotations (not merely `@Controller` with a meta-annotation the
+ * plain `Controller` alternative would catch — `@RestController` doesn't
+ * literally start with the text `Controller`), so they need their own
+ * alternatives here; recall win, zero precision risk, since both are
+ * unambiguously component-scanned bean stereotypes just like the other four.
+ */
+const SPRING_STEREOTYPE_ANNOTATIONS = [
+  'Component',
+  'Service',
+  'Repository',
+  'Controller',
+  'RestController',
+  'RestControllerAdvice',
+];
 
 /**
  * Reused across all four stereotypes: `@Stereotype` optionally followed by
@@ -204,6 +219,26 @@ function isXmlBeanJoinSourceRef(ref: UnresolvedRef, context?: ResolutionContext)
 }
 
 /**
+ * Does `ref` come from the `@Value`/`@ConfigurationProperties` config-key
+ * channel that mints the `:prefix` sentinel (`extractSpringValueBindings`
+ * below) — i.e. is `claimsReference`'s `:prefix` branch actually entitled to
+ * opt this ref through the pre-filter on sentinel shape alone? Same leak
+ * class `isXmlBeanJoinSourceRef` closes for the bean-name-shape claim below
+ * it: a `claimsReference` opt-in keyed on NAME SHAPE alone (here, "ends with
+ * `:prefix`") would otherwise accept a same-shaped name from ANY
+ * language/extractor and route it through the FULL resolution pipeline
+ * (every other framework, import resolution, `matchFuzzy`) — not just this
+ * resolver's own `resolve()`. `extractSpringValueBindings` only ever mints
+ * this sentinel on a `references`-kind ref sourced from Java/Kotlin, so
+ * that's the gate — same referenceKind+language check `isXmlBeanJoinSourceRef`
+ * makes, just scoped to this channel's own actual source (java/kotlin)
+ * instead of the XML bean join's (xml).
+ */
+function isSpringConfigPrefixSourceRef(ref: UnresolvedRef): boolean {
+  return ref.referenceKind === 'references' && (ref.language === 'java' || ref.language === 'kotlin');
+}
+
+/**
  * A bare identifier shaped like a decapitalized multi-word class name
  * (`userService`, `dataSourceBean`) — starts lowercase, has at least one
  * LATER uppercase letter (a genuine camelCase word boundary), and no
@@ -257,10 +292,15 @@ export const springResolver: FrameworkResolver = {
     // `@ConfigurationProperties(prefix="app.cache")` emits a reference whose
     // name carries the `:prefix` sentinel — there's no declared symbol with
     // that exact spelling, so the resolver's name-existence pre-filter would
-    // drop it. Opt those through. (This sentinel is only ever emitted on a
-    // java/kotlin-sourced `references` ref by `extractSpringValueBindings`,
-    // so it can't collide with an unrelated xml/other-language ref.)
-    if (name.endsWith(':prefix')) return true;
+    // drop it. Opt those through — but gated on `ref` actually being that
+    // channel (`isSpringConfigPrefixSourceRef`), not on name shape alone:
+    // `extractSpringValueBindings` only ever mints this sentinel on a
+    // java/kotlin-sourced `references` ref, but nothing stops an unrelated
+    // ref from a DIFFERENT language/channel happening to end in `:prefix`
+    // too, and an ungated claim here would route THAT through the full
+    // resolution pipeline on shape alone — the same leak class
+    // `isXmlBeanJoinSourceRef` closes for the shape claim just below.
+    if (name.endsWith(':prefix')) return !!ref && isSpringConfigPrefixSourceRef(ref);
     // See `XML_BEAN_JOIN_NAME_SHAPE_RE`'s doc comment above. The shape check
     // alone is NOT enough to opt a ref in: without `ref`/`context` this
     // resolver cannot tell a genuinely-dangling XML bean `ref=` apart from

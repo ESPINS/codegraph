@@ -4,6 +4,8 @@ import * as path from 'path';
 import * as os from 'os';
 import { extractFromSource } from '../src/extraction/tree-sitter';
 import { CodeGraph } from '../src';
+import { springResolver } from '../src/resolution/frameworks/java';
+import type { UnresolvedRef } from '../src/resolution/types';
 import type { UnresolvedReference, Node } from '../src/types';
 
 // Spring beans XML extractor. Modeled on mybatis-extractor-robustness.test.ts's
@@ -424,13 +426,15 @@ describe('Spring beans extractor — PLACEHOLDER-REF DEFAULT (v1.1: ref="${env.p
     expect(names).not.toContain('defaultBean');
   });
 
-  it('drops a placeholder default containing a hyphen (${prop:a-b}) — a legal hyphenated Spring bean name that the DEFAULT regex deliberately does not capture', () => {
+  it('resolves a placeholder default containing a hyphen (${prop:my-bean-name}) — hyphenated bean names are legal', () => {
     const xml =
       '<beans><bean id="a" class="com.example.A">' +
-      '<property name="dep" ref="${env.prop:my-bean}"/>' +
+      '<property name="dep" ref="${env.prop:my-bean-name}"/>' +
       '</bean></beans>';
     const a = beanByName(xml, 'a')!;
-    expect(refsFrom(xml, a.id)).toHaveLength(0);
+    const names = refsFrom(xml, a.id).map((r) => r.referenceName);
+    expect(names).toContain('my-bean-name');
+    expect(names).not.toContain('${env.prop:my-bean-name}');
   });
 
   it('a nested placeholder default (${p:${q}}) matches neither placeholder regex and falls through as the raw literal, unmatched', () => {
@@ -493,6 +497,20 @@ describe('Spring beans extractor — by-value class promotion (blind spot ⑶: j
     const job = beanByName(xml, 'job')!;
     const r = refs(xml).filter((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates');
     expect(r.map((x) => x.referenceName)).toContain('com.example.job::SyncJob');
+  });
+
+  it('strips an XML comment embedded in a <value> child\'s text instead of leaking it into the FQN (regression vs the attribute-value path)', () => {
+    const xml =
+      '<beans><bean id="job" class="org.springframework.scheduling.quartz.JobDetailFactoryBean">' +
+      '<property name="jobClass"><value>com.example.<!-- x -->Foo</value></property>' +
+      '</bean></beans>';
+    const job = beanByName(xml, 'job')!;
+    const r = refs(xml).filter((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates');
+    // Comment removed, text trimmed to a clean FQN — never the raw
+    // `com.example.<!-- x -->Foo` (which would fail isFqnShapedValue's
+    // identifier-segment check and just as silently vanish, masking the
+    // leak as a false negative instead of a mangled positive).
+    expect(r.map((x) => x.referenceName)).toContain('com.example::Foo');
   });
 
   it('promotes the p-namespace literal form (p:jobClass="…")', () => {
@@ -1171,5 +1189,67 @@ describe('Spring beans extractor — ANNOTATION-SCANNED BEAN JOIN (v1.1 V3-scanJ
     const outgoing = cg.getOutgoingEdges(getUser!.id);
     const wrongEdge = outgoing.find((e) => e.target === annotatedClass!.id);
     expect(wrongEdge).toBeUndefined();
+  });
+
+  it('joins ref="userService" to an @RestController-annotated class via the same derived-name rule (REST stereotype recall)', async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-spring-beans-scanjoin-restcontroller-'));
+    const srcDir = path.join(tempDir, 'src', 'main', 'java', 'com', 'example');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(srcDir, 'UserService.java'),
+      'package com.example;\n\n' +
+        'import org.springframework.web.bind.annotation.RestController;\n\n' +
+        '@RestController\npublic class UserService {\n    public UserService() {}\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'applicationContext.xml'),
+      '<beans><bean id="controller" class="com.example.UserController">' +
+        '<property name="userService" ref="userService"/></bean></beans>\n'
+    );
+
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+
+    const controller = cg.getNodesByKind('variable').find((n) => n.name === 'controller');
+    const userService = cg.getNodesByKind('class').find((n) => n.name === 'UserService');
+    expect(controller).toBeDefined();
+    expect(userService).toBeDefined();
+
+    const outgoing = cg.getOutgoingEdges(controller!.id);
+    const referenceEdge = outgoing.find((e) => e.kind === 'references' && e.target === userService!.id);
+    expect(referenceEdge).toBeDefined();
+    expect(referenceEdge!.metadata?.resolvedBy).toBe('framework');
+  });
+});
+
+describe('springResolver.claimsReference — `:prefix` sentinel gate (no shape-only leak)', () => {
+  it('claims a `:prefix`-suffixed name when the ref is the java/kotlin @ConfigurationProperties channel it is scoped to', () => {
+    const ref: UnresolvedRef = {
+      fromNodeId: 'n1',
+      referenceName: 'app.cache:prefix',
+      referenceKind: 'references',
+      line: 1,
+      column: 0,
+      filePath: 'src/main/java/com/example/AppConfig.java',
+      language: 'java',
+    };
+    expect(springResolver.claimsReference!('app.cache:prefix', ref)).toBe(true);
+  });
+
+  it('does NOT claim a `:prefix`-suffixed name whose ref is sourced from a different language (shape-only leak the gate closes)', () => {
+    const ref: UnresolvedRef = {
+      fromNodeId: 'n1',
+      referenceName: 'app.cache:prefix',
+      referenceKind: 'references',
+      line: 1,
+      column: 0,
+      filePath: 'applicationContext.xml',
+      language: 'xml',
+    };
+    expect(springResolver.claimsReference!('app.cache:prefix', ref)).toBe(false);
+  });
+
+  it('does NOT claim a `:prefix`-suffixed name when no ref is passed at all (conservative, same stance as the shape-based claim below it)', () => {
+    expect(springResolver.claimsReference!('app.cache:prefix')).toBe(false);
   });
 });

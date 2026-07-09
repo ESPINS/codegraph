@@ -81,6 +81,47 @@ function stripXmlNoise(source: string): string {
   return out.join('');
 }
 
+/**
+ * Remove real XML comments from a TEXT slice while leaving any CDATA section
+ * untouched — used only by `getElementText`, which (unlike every other
+ * offset-derived read in this class) re-slices the ORIGINAL, unblanked
+ * `rawSource` instead of the comment/CDATA-blanked `this.source` (so a
+ * CDATA-wrapped `<value>` keeps its literal text — see `getElementText`'s doc
+ * comment). That re-read bypasses `stripXmlNoise`'s comment blanking, so
+ * without this, a comment embedded in element text (`<value>com.example.
+ * <!-- x -->Foo</value>`) leaks verbatim into the by-value class-promotion
+ * text `getPropertyValue` feeds `isFqnShapedValue`/`javaFqnToQualifiedName`
+ * — a regression vs. every attribute-value path (`class="…"`, `value="…"`),
+ * which is always parsed out of the already comment-blanked `this.source`
+ * and can therefore never contain literal comment text.
+ * Same either-construct-first scanning order as `stripXmlNoise`: a CDATA
+ * section is copied through verbatim BEFORE the comment scan would otherwise
+ * reach it, so a `<!--`/`-->`-shaped sequence deliberately placed inside
+ * CDATA content is data, never mistaken for a real comment to strip.
+ */
+function stripCommentsKeepCData(text: string): string {
+  let out = '';
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    if (text.startsWith('<!--', i)) {
+      const end = text.indexOf('-->', i + 4);
+      i = end >= 0 ? end + 3 : n;
+      continue;
+    }
+    if (text.startsWith('<![CDATA[', i)) {
+      const end = text.indexOf(']]>', i + 9);
+      const stop = end >= 0 ? end + 3 : n;
+      out += text.slice(i, stop);
+      i = stop;
+      continue;
+    }
+    out += text[i];
+    i++;
+  }
+  return out;
+}
+
 /** Strip a namespace prefix (`beans:beans` → `beans`) for tag matching that must ignore it. */
 function localName(tag: string): string {
   const colon = tag.indexOf(':');
@@ -289,8 +330,14 @@ function isFqnShapedValue(value: string): boolean {
  * ENTIRE ref value is one placeholder — `pushRef`'s caller for mixed text
  * around a placeholder (`prefix${env.prop:default}`) falls through
  * unmatched to the ordinary literal-string path, unaffected by this rule.
+ * The capture class includes `-` — hyphens are legal in Spring bean ids/
+ * names (`${env.prop:my-bean-name}` is a real, resolvable default), so
+ * excluding it would silently drop an otherwise-fine default. (Note this
+ * doesn't broaden the class to arbitrary punctuation — still no `$`/`{`/`}`/
+ * whitespace/etc., which is what keeps this anchored regex from swallowing
+ * a nested placeholder default; see `PLACEHOLDER_REF_NO_DEFAULT_RE` below.)
  */
-const PLACEHOLDER_REF_DEFAULT_RE = /^\$\{[^}:]*:([A-Za-z_][A-Za-z0-9_.]*)\}$/;
+const PLACEHOLDER_REF_DEFAULT_RE = /^\$\{[^}:]*:([A-Za-z_][A-Za-z0-9_.-]*)\}$/;
 
 /**
  * A bare placeholder with NO default (`${prop}` alone, the whole ref
@@ -300,14 +347,12 @@ const PLACEHOLDER_REF_DEFAULT_RE = /^\$\{[^}:]*:([A-Za-z_][A-Za-z0-9_.]*)\}$/;
  * stance `isFqnShapedValue` already takes for the by-value class-promotion
  * channel's own `${…}` values. Matched broadly (any content but `}`, no
  * colon requirement) so it also catches a default shape the stricter
- * DEFAULT regex above rejects — e.g. `${prop:123bad}` (default starts with
- * a digit) and, notably, `${prop:a-b}` (default contains a hyphen). The
- * latter is NOT malformed XML — hyphens are legal in Spring bean ids/names
- * — it is simply a shape this extractor deliberately doesn't resolve: the
- * DEFAULT regex's capture class excludes `-` on purpose (kept narrow to
- * avoid over-matching), so a real, legal hyphenated bean-name default is
- * silently dropped here rather than resolved. Accepted recall loss, not a
- * correctness bug — see the pinning test for this exact drop.
+ * DEFAULT regex above still rejects — e.g. `${prop:123bad}` (default starts
+ * with a digit, which the DEFAULT regex's leading `[A-Za-z_]` requirement
+ * excludes on purpose: a bean id/name can't start with a digit either).
+ * Accepted recall loss on that shape, not a correctness bug — see the
+ * pinning test for it. (A hyphenated default, `${prop:a-b}`, no longer
+ * lands here — the DEFAULT regex above now captures it directly.)
  *
  * Because the character class is `[^}]*`, it stops at the FIRST `}` in the
  * string. A nested placeholder default — `${p:${q}}` — has its inner `}`
@@ -876,8 +921,13 @@ export class SpringBeansExtractor {
    * computed against), but the actual text is sliced out of `this.rawSource`
    * instead — `this.source` would return only blanked whitespace for
    * `<value><![CDATA[com.example.job.SyncJob]]></value>`, since
-   * `stripXmlNoise` blanks CDATA content. The `<![CDATA[`/`]]>` wrapper (if
-   * any) is stripped from the recovered raw slice before entity-decoding.
+   * `stripXmlNoise` blanks CDATA content. Because that raw slice is
+   * unblanked, a literal `<!--…-->` comment embedded in the text (unlike a
+   * comment anywhere else, which `this.source` already blanked before this
+   * class ever sees it) survives into it too — `stripCommentsKeepCData`
+   * removes it (CDATA content passed through untouched) before the
+   * `<![CDATA[`/`]]>` wrapper (if any) is stripped and the result is
+   * entity-decoded.
    */
   private getElementText(el: XmlEl): string {
     const src = this.source;
@@ -891,7 +941,8 @@ export class SpringBeansExtractor {
       textEnd = closeStart > openTagEnd ? closeStart : el.end;
     }
     const raw = this.rawSource.slice(openTagEnd + 1, textEnd);
-    const unwrapped = raw.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1');
+    const withoutComments = stripCommentsKeepCData(raw);
+    const unwrapped = withoutComments.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1');
     return decodeXmlEntities(unwrapped).trim();
   }
 
