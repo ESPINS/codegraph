@@ -351,6 +351,54 @@ describe('Spring beans extractor — bean→bean references channels', () => {
   });
 });
 
+describe('Spring beans extractor — PLACEHOLDER-REF DEFAULT (v1.1: ref="${env.prop:defaultBeanName}")', () => {
+  it('resolves ref="${env.prop:defaultBeanName}" to the DEFAULT bean name, not the raw placeholder string', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A">' +
+      '<property name="dep" ref="${env.prop:defaultBean}"/>' +
+      '</bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    const names = refsFrom(xml, a.id).map((r) => r.referenceName);
+    expect(names).toContain('defaultBean');
+    expect(names).not.toContain('${env.prop:defaultBean}');
+  });
+
+  it('drops a placeholder with no default (${prop} alone) — unevaluable, no reference emitted', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A">' +
+      '<property name="dep" ref="${env.prop}"/>' +
+      '</bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    expect(refsFrom(xml, a.id)).toHaveLength(0);
+  });
+
+  it('does NOT resolve a default when the placeholder is only part of the value (prefix${env.prop:default}) — falls through as the raw literal, unmatched', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A">' +
+      '<property name="dep" ref="prefix${env.prop:defaultBean}"/>' +
+      '</bean></beans>';
+    const a = beanByName(xml, 'a')!;
+    const names = refsFrom(xml, a.id).map((r) => r.referenceName);
+    expect(names).toContain('prefix${env.prop:defaultBean}');
+    expect(names).not.toContain('defaultBean');
+  });
+
+  it('does NOT apply DEFAULT-extraction to class= (bean-ref channels only, never the by-value class attribute)', () => {
+    const xml = '<beans><bean id="a" class="${env.prop:com.example.DefaultClass}"/></beans>';
+    const a = beanByName(xml, 'a')!;
+    const instantiates = refs(xml).filter((x) => x.fromNodeId === a.id && x.referenceKind === 'instantiates');
+    expect(instantiates.some((x) => x.referenceName === 'com.example::DefaultClass')).toBe(false);
+  });
+
+  it('also resolves the default through the p:*-ref namespace channel (same shared pushRef path)', () => {
+    const xml =
+      '<beans><bean id="a" class="com.example.A" p:service-ref="${env.svc:defaultSvc}"/></beans>';
+    const a = beanByName(xml, 'a')!;
+    const names = refsFrom(xml, a.id).map((r) => r.referenceName);
+    expect(names).toContain('defaultSvc');
+  });
+});
+
 describe('Spring beans extractor — by-value class promotion (blind spot ⑶: jobClass/targetClass/…)', () => {
   it('promotes <property name="jobClass" value="…"> (attribute value form, the classic Quartz shape)', () => {
     const xml =

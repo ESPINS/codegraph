@@ -29,7 +29,12 @@ import { generateNodeId } from './tree-sitter-helpers';
  * ⑵ mapperLocations/configLocation file-edge promotion (the future
  * Spring↔MyBatis bridge). Blind spot ⑶ (jobClass/targetClass by-value FQN
  * promotion) IS implemented as of v1.1 — see `isClassLikePropertyName` /
- * `pushClassPromotion` below.
+ * `pushClassPromotion` below. Also new in v1.1: a bean-ref attribute value
+ * shaped as a Spring property placeholder WITH a default
+ * (`ref="${env.prop:defaultBeanName}"`, a real-world pattern found in
+ * validation) resolves to the default bean name instead of dangling on the
+ * unresolvable placeholder string — see `PLACEHOLDER_REF_DEFAULT_RE` /
+ * `pushRef` below.
  */
 
 // ---------------------------------------------------------------------------
@@ -271,6 +276,34 @@ function isFqnShapedValue(value: string): boolean {
   const lastSegment = value.slice(value.lastIndexOf('.') + 1);
   return /^[A-Z]/.test(lastSegment);
 }
+
+/**
+ * A Spring property placeholder used AS a bean-ref value — a real-world
+ * pattern found in validation: `ref="${env.prop:defaultBeanName}"`. Spring
+ * resolves `env.prop` at runtime and falls back to the literal
+ * `defaultBeanName` after the `:` when the property is unset. Statically we
+ * can't know the property's value, but the DEFAULT is a real, literal bean
+ * name asserted right there in the XML — worth resolving to, unlike the
+ * placeholder expression itself (`${env.prop:defaultBeanName}`, which no
+ * real bean is ever named). Anchored (`^…$`) so it only matches when the
+ * ENTIRE ref value is one placeholder — `pushRef`'s caller for mixed text
+ * around a placeholder (`prefix${env.prop:default}`) falls through
+ * unmatched to the ordinary literal-string path, unaffected by this rule.
+ */
+const PLACEHOLDER_REF_DEFAULT_RE = /^\$\{[^}:]*:([A-Za-z_][A-Za-z0-9_.]*)\}$/;
+
+/**
+ * A bare placeholder with NO default (`${prop}` alone, the whole ref
+ * value) — nothing statically resolvable is asserted in the XML at all
+ * (unlike the `:default` form above), so `pushRef` drops it: no
+ * `references` edge is emitted, same "don't fabricate a maybe-wrong edge"
+ * stance `isFqnShapedValue` already takes for the by-value class-promotion
+ * channel's own `${…}` values. Matched broadly (any content, no colon
+ * requirement) so it also catches a malformed/unsupported default shape
+ * (`${prop:123bad}`, `${prop:a-b}`) that fails the stricter DEFAULT regex
+ * above — those have no statically-resolvable name either.
+ */
+const PLACEHOLDER_REF_NO_DEFAULT_RE = /^\$\{[^}]*\}$/;
 
 /**
  * Namespace prefixes whose id-bearing elements register a bean-like target
@@ -935,12 +968,25 @@ export class SpringBeansExtractor {
   }
 
   /**
-   * Push a bean→bean `references` edge, normalizing away the two ways a raw
+   * Push a bean→bean `references` edge, normalizing away the ways a raw
    * attribute value can be a non-reference: empty/whitespace-only (`ref=""`
-   * must never produce an empty referenceName) and a factory-dereference
-   * `&` prefix (`ref="&factoryBean"` refers to the *factory bean itself*,
-   * not the object it produces — stripped before matching, same as the
-   * spec's ByteSpan-level treatment).
+   * must never produce an empty referenceName), a factory-dereference `&`
+   * prefix (`ref="&factoryBean"` refers to the *factory bean itself*, not
+   * the object it produces — stripped before matching, same as the spec's
+   * ByteSpan-level treatment), and (v1.1) a property-placeholder value
+   * (`ref="${env.prop:defaultBeanName}"`) — resolved to its DEFAULT bean
+   * name when one is present (`PLACEHOLDER_REF_DEFAULT_RE`), or dropped
+   * entirely when it isn't (`PLACEHOLDER_REF_NO_DEFAULT_RE` — see both
+   * regexes' doc comments). This is the single ref-reading path shared by
+   * every bean-ref channel (`property`/`constructor-arg` `ref=`, `<ref>`/
+   * `<idref>` `bean=`/`local=`, `<entry key-ref=/value-ref=>`, `parent=`,
+   * `depends-on=`, `factory-bean=`, `lookup-method@bean`,
+   * `replaced-method@replacer`, p:/c: namespace `-ref` attrs) — routing the
+   * placeholder-default rule through here, rather than duplicating it per
+   * call site, is what makes it apply uniformly across all of them. It is
+   * deliberately NOT reached by `class=`/`value=` (those go through
+   * `pushClassPromotion`, a separate channel), so this rule never touches
+   * by-value class literals.
    */
   private pushRef(fromNodeId: string | null, raw: string | undefined, line: number): void {
     if (!fromNodeId || !raw) return;
@@ -948,6 +994,12 @@ export class SpringBeansExtractor {
     if (!v) return;
     if (v.startsWith('&')) v = v.slice(1).trim();
     if (!v) return;
+    const placeholderDefault = PLACEHOLDER_REF_DEFAULT_RE.exec(v);
+    if (placeholderDefault) {
+      v = placeholderDefault[1]!;
+    } else if (PLACEHOLDER_REF_NO_DEFAULT_RE.test(v)) {
+      return; // ${prop} alone (or an unsupported default shape) — unevaluable, drop.
+    }
     this.unresolvedReferences.push({ fromNodeId, referenceName: v, referenceKind: 'references', line, column: 0 });
   }
 
