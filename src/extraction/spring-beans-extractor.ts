@@ -43,10 +43,14 @@ import { generateNodeId } from './tree-sitter-helpers';
  * tags by the regex tokenizer below. Length-preserving (bytes become spaces,
  * newlines survive) so offsets/line numbers computed afterward still map to
  * the original source — same technique as `MyBatisExtractor.stripXmlComments`.
- * Unlike MyBatis, we never need element TEXT content (only tag/attribute
- * structure), so — unlike the sibling — CDATA content is blanked here too,
- * not preserved: MyBatis needs the raw SQL body for its docstring preview,
- * we don't need bean XML text content for anything.
+ * The tree built from THIS blanked string is what everything else (tag/
+ * attribute structure, and the byte offsets `getElementText` walks) is
+ * computed from — comment/CDATA content must never leak into a tag or
+ * attribute. Element TEXT content (`getElementText`, used by
+ * `getPropertyValue` for the `<value>`-child by-value-class-promotion form)
+ * is the one exception: it re-slices those same offsets out of the ORIGINAL,
+ * unblanked `rawSource` instead, so a CDATA-wrapped `<value>` still yields
+ * its text — see `getElementText`.
  */
 function stripXmlNoise(source: string): string {
   const out = source.split('');
@@ -249,9 +253,23 @@ function isClassLikePropertyName(name: string): boolean {
  * simple class name, or an ordinary non-FQN string) is deliberately
  * excluded: promoting on a wrong-shaped value would fabricate a
  * java-linkage edge nothing in the XML actually asserts.
+ *
+ * Additionally, the LAST dotted segment (the class-name position — what
+ * `javaFqnToQualifiedName` maps to the part after `::`) must start with an
+ * uppercase letter, matching universal Java class-naming convention. This
+ * rejects a value like `com.example.svc.doWork` (shaped like a fully-
+ * qualified METHOD reference, not a class — the segment-count/identifier
+ * check above alone can't tell those apart) without fabricating a
+ * java-linkage edge for it: a lowercase-led final segment can never be a
+ * real Java class's simple name, so promoting it would only ever add
+ * resolver noise (an unresolved reference, never a wrong one, since no real
+ * Java class node's qualifiedName would match it) — this tightens the
+ * heuristic to skip generating that noise in the first place.
  */
 function isFqnShapedValue(value: string): boolean {
-  return /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/.test(value);
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/.test(value)) return false;
+  const lastSegment = value.slice(value.lastIndexOf('.') + 1);
+  return /^[A-Z]/.test(lastSegment);
 }
 
 /**
@@ -355,6 +373,15 @@ class LenientXmlTreeParser {
 export class SpringBeansExtractor {
   private filePath: string;
   private source: string;
+  /**
+   * The original, unblanked source — kept only so `getElementText` can
+   * recover a CDATA-wrapped `<value>`'s literal text (`stripXmlNoise` blanks
+   * CDATA content in `this.source` for tag-scanning safety; see that
+   * function's doc comment). Every offset computed against `this.source`
+   * still lines up with `rawSource` (comment/CDATA blanking is length- and
+   * newline-preserving), so re-slicing the same range here is safe.
+   */
+  private rawSource: string;
   private nodes: Node[] = [];
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
@@ -367,6 +394,7 @@ export class SpringBeansExtractor {
 
   constructor(filePath: string, source: string) {
     this.filePath = filePath;
+    this.rawSource = source;
     this.source = stripXmlNoise(source);
     this.computeLineStarts();
   }
@@ -792,6 +820,14 @@ export class SpringBeansExtractor {
    * instead of this element's own, corrupting the text with a trailing
    * `</value>` tail. Anchoring the tag-specific search one position earlier
    * and requiring an exact tag-name match rules that out.
+   *
+   * Tag/text boundaries above are found by scanning `this.source` (the
+   * comment/CDATA-blanked string every other offset in this class is
+   * computed against), but the actual text is sliced out of `this.rawSource`
+   * instead — `this.source` would return only blanked whitespace for
+   * `<value><![CDATA[com.example.job.SyncJob]]></value>`, since
+   * `stripXmlNoise` blanks CDATA content. The `<![CDATA[`/`]]>` wrapper (if
+   * any) is stripped from the recovered raw slice before entity-decoding.
    */
   private getElementText(el: XmlEl): string {
     const src = this.source;
@@ -804,7 +840,9 @@ export class SpringBeansExtractor {
       const closeStart = src.lastIndexOf(`</${el.tag}`, el.end - 1);
       textEnd = closeStart > openTagEnd ? closeStart : el.end;
     }
-    return decodeXmlEntities(src.slice(openTagEnd + 1, textEnd)).trim();
+    const raw = this.rawSource.slice(openTagEnd + 1, textEnd);
+    const unwrapped = raw.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1');
+    return decodeXmlEntities(unwrapped).trim();
   }
 
   /**

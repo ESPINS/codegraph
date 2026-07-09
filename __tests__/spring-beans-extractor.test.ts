@@ -419,6 +419,32 @@ describe('Spring beans extractor — by-value class promotion (blind spot ⑶: j
     expect(r.map((x) => x.referenceName)).toContain('com.example::Outer::Inner');
   });
 
+  it('promotes a CDATA-wrapped <value> child (<value><![CDATA[...]]></value>)', () => {
+    const xml =
+      '<beans><bean id="job" class="org.springframework.scheduling.quartz.JobDetailFactoryBean">' +
+      '<property name="jobClass"><value><![CDATA[com.example.job.SyncJob]]></value></property>' +
+      '</bean></beans>';
+    const job = beanByName(xml, 'job')!;
+    const r = refs(xml).filter((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates');
+    expect(r.map((x) => x.referenceName)).toContain('com.example.job::SyncJob');
+  });
+
+  it('promotes the c-namespace literal form (c:jobClass="…")', () => {
+    const xml = '<beans><bean id="job" class="com.example.JobHolder" c:jobClass="com.example.job.SyncJob"/></beans>';
+    const job = beanByName(xml, 'job')!;
+    const r = refs(xml).filter((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates');
+    expect(r.map((x) => x.referenceName)).toContain('com.example.job::SyncJob');
+  });
+
+  it('promotes a p:jobClass literal declared via a non-conventional xmlns prefix', () => {
+    const xml =
+      '<beans xmlns:pp="http://www.springframework.org/schema/p">' +
+      '<bean id="job" class="com.example.JobHolder" pp:jobClass="com.example.job.SyncJob"/></beans>';
+    const job = beanByName(xml, 'job')!;
+    const r = refs(xml).filter((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates');
+    expect(r.map((x) => x.referenceName)).toContain('com.example.job::SyncJob');
+  });
+
   // Every negative below uses a bean WITHOUT its own `class=` attribute
   // (id-only, `parent=`-anchored) so the promotion channel under test is the
   // ONLY possible source of an `instantiates` reference — an unguarded
@@ -468,6 +494,48 @@ describe('Spring beans extractor — by-value class promotion (blind spot ⑶: j
       '</bean></beans>';
     const job = beanByName(xml, 'job')!;
     expect(refs(xml).some((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates')).toBe(false);
+  });
+
+  it('does NOT promote a lowercase-led final segment (method-shaped, not class-shaped)', () => {
+    const xml =
+      '<beans><bean id="job" parent="jobBase">' +
+      '<property name="listenerClass" value="com.example.svc.doWork"/>' +
+      '</bean></beans>';
+    const job = beanByName(xml, 'job')!;
+    expect(refs(xml).some((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates')).toBe(false);
+  });
+
+  it('does NOT promote a ${placeholder} value in the <value>-child form', () => {
+    const xml =
+      '<beans><bean id="job" parent="jobBase">' +
+      '<property name="jobClass"><value>${job.class}</value></property>' +
+      '</bean></beans>';
+    const job = beanByName(xml, 'job')!;
+    expect(refs(xml).some((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates')).toBe(false);
+  });
+
+  it('does NOT promote a ${placeholder} value in the p-namespace literal form', () => {
+    const xml = '<beans><bean id="job" parent="jobBase" p:jobClass="${job.class}"/></beans>';
+    const job = beanByName(xml, 'job')!;
+    expect(refs(xml).some((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates')).toBe(false);
+  });
+
+  it('does NOT promote a p:jobClass-ref attribute (bean reference, not a by-value class literal)', () => {
+    const xml = '<beans><bean id="job" parent="jobBase" p:jobClass-ref="someBean"/></beans>';
+    const job = beanByName(xml, 'job')!;
+    expect(refs(xml).some((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates')).toBe(false);
+    // It's still picked up on the ordinary references channel, not dropped entirely.
+    expect(refsFrom(xml, job.id).map((r) => r.referenceName)).toContain('someBean');
+  });
+
+  it('does NOT promote a <property name="jobClass" ref="…"/> (bean reference, not a by-value class literal)', () => {
+    const xml =
+      '<beans><bean id="job" parent="jobBase">' +
+      '<property name="jobClass" ref="someBean"/>' +
+      '</bean></beans>';
+    const job = beanByName(xml, 'job')!;
+    expect(refs(xml).some((x) => x.fromNodeId === job.id && x.referenceKind === 'instantiates')).toBe(false);
+    expect(refsFrom(xml, job.id).map((r) => r.referenceName)).toContain('someBean');
   });
 });
 
@@ -649,6 +717,39 @@ describe('Spring beans extractor — bean→class instantiates edge resolves end
     const instantiates = outgoing.find((e) => e.kind === 'instantiates');
     expect(instantiates).toBeDefined();
     expect(instantiates!.target).toBe(fooServiceImpl!.id);
+  });
+
+  it('resolves a promoted by-value jobClass property (blind spot ⑶) to the actual Java class node', async () => {
+    // Pins the referenceName-shape contract (javaFqnToQualifiedName) between
+    // the promoted channel and the resolver — the headline `class=` channel
+    // already has this end-to-end coverage above; the promoted channel was
+    // previously only asserted at the unresolvedReferences layer.
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-spring-beans-jobclass-test-'));
+    const srcDir = path.join(tempDir, 'src', 'main', 'java', 'com', 'example', 'job');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(srcDir, 'SyncJob.java'),
+      'package com.example.job;\n\npublic class SyncJob {\n    public SyncJob() {}\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'applicationContext.xml'),
+      '<beans><bean id="job" class="org.springframework.scheduling.quartz.JobDetailFactoryBean">' +
+        '<property name="jobClass" value="com.example.job.SyncJob"/>' +
+        '</bean></beans>\n'
+    );
+
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+
+    const job = cg.getNodesByKind('variable').find((n) => n.name === 'job');
+    expect(job).toBeDefined();
+
+    const syncJob = cg.getNodesByKind('class').find((n) => n.name === 'SyncJob');
+    expect(syncJob).toBeDefined();
+
+    const outgoing = cg.getOutgoingEdges(job!.id);
+    const instantiates = outgoing.find((e) => e.kind === 'instantiates' && e.target === syncJob!.id);
+    expect(instantiates).toBeDefined();
   });
 });
 
